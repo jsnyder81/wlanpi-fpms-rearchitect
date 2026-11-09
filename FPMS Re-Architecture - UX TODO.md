@@ -107,6 +107,9 @@ Second batch of user feedback after the round-1 deploy.
 
 **Fix:** coalesce renders in the TUI — on `view`/`event` frames set a dirty flag and repaint at most once per short interval (~50-80 ms, Textual `set_interval`/`call_later` pattern), always rendering the LATEST frame state. Input must still send immediately on keypress (verify `on_key` → `_send_frame` has no await-behind-render path). Add a test: burst of 5 input frames in quick succession results in ≤2 refreshes.
 
+### Addendum during round-2 fixes (Nov 9)
+- **m5 required a protocol change** the original brief forbade: `topic_device_summary` sets `additionalProperties: false`, so eth0/wlan0 could not be added without touching `frames.schema.json`. Coordinator approved an **additive v1** change (same precedent as the `nav` frame): optional `eth0`/`wlan0` properties, the invalid-sample repurposed to a different unknown key so the strictness guard stays tested, PROTOCOL.md documents it, and the webui vendored schema + generated types re-synced.
+
 ## Verification bar for round 2
 
 - Menu: one Network interfaces entry; table shows grouped Ethernet/WLAN rows on TUI, panel and WebUI; parity list updated.
