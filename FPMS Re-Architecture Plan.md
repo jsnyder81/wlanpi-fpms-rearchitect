@@ -109,8 +109,8 @@ Actions that need logic (multi-step flows, the composed adapter summary from cor
 
 | Mode | Used by | Server holds | Client sends |
 | --- | --- | --- | --- |
-| Thin | Panel, TUI | The nav cursor; renders the current view | `input` (up, down, left, right, center, key1 to key3) |
-| Rich | WebUI, mobile app | Nothing per screen | `invoke` on a node id; navigates the tree locally |
+| Thin | Panel, TUI, WebUI (private or panel-mirror) | The nav cursor; renders the current view | `input` (up, down, left, right, center, key1 to key3) |
+| Rich | WebUI, mobile app | Nothing per screen | `invoke` on a node id; navigates the tree locally, `nav` to pull the server-rendered view for a node |
 
 Both modes share the same jobs, prompts and results.
 
@@ -120,7 +120,7 @@ The service holds one persistent **default session**: its cursor and current vie
 
 - Input from any surface attached to the default session moves the one cursor, and the resulting `view` fans out to all of them. Concurrent input is last-write-wins; each `view` names the principal that produced it so surfaces may show, for example, "driven from the WebUI".
 - A `prompt` on the default session goes to every attached surface; the first `answer` wins and the others see it resolved. A confirmation stays bound to the invoking principal: attached surfaces can see it, but only the invoker can answer it.
-- Rich-mode clients navigate locally by definition; a WebUI panel that mirrors the default screen is a thin-mode attach.
+- Rich-mode clients navigate locally by definition; the WebUI exposes all three shapes — rich (private session), thin (private session) and thin (mirror of the default session) — via its mode control (UX polish round, Nov 9).
 - The default session's state survives surfaces connecting and disconnecting; a reconnecting surface just receives the current `view`.
 
 ### Messages
@@ -133,6 +133,7 @@ Every frame is `{"v":1, "type":"...", "id":"<client msg id>", ...}`. The server 
 | C to S | `hello` | Mode, `session` (`default` to attach or `new` for an independent session), capabilities (screen size, colour), protocol versions, last `epoch` and sequence numbers |
 | C to S | `subscribe` / `unsubscribe` | Topics such as `device.summary`, `complications`, `alerts`, `jobs` |
 | C to S | `input` | Thin mode button event |
+| C to S | `nav` | Move the session cursor directly to `node` (ancestors auto-expanded); service pushes the resulting `view`. Added in the Phase 2 UX polish round (Nov 9) so rich-mode browsers can show server-rendered landing views; additive to protocol v1 |
 | C to S | `invoke` | Run a node's action with `params`; returns a `job_id` |
 | C to S | `answer` | Reply to a `prompt` (selection, confirmation, parameter form) |
 | C to S | `page` | Next page of a large result, by cursor |
@@ -358,6 +359,16 @@ Repos: `wlanpi-webui`, `wlanpi-menud`.
 - Browser rendering of view blocks. Cockpit is **not** retired in this project (decision Nov 9: only the fpms2/menud prototype had a menu surface; the existing Cockpit plugin stays untouched).
 
 Exit: the TUI and two browser tabs run concurrently; WebUI logout ends that user's browser sessions.
+
+#### Phase 2 UX polish round (November 9, 2026)
+
+Post-rollout user feedback, batched in *FPMS Re-Architecture - UX TODO.md* (repo root) and implemented across `wlanpi-menu-tui`, `wlanpi-menud` and `wlanpi-webui`:
+
+1. **TUI menu tree hidden by default** — the full-hierarchy tree panel was a Phase 1 dev/parity aid ("reference only"); it is now off, toggled with `t`. The client still holds the tree for breadcrumbs.
+2. **`nav` frame added to the protocol** (additive v1, see Messages) — lets a rich-mode client fetch the server-rendered view for any node.
+3. **WebUI rich mode: click shows results** — no-param view/status actions (e.g. Network > Interfaces) now invoke on a single click and render in the Results column; branch cards use `nav` for landing views. Fixes the "No actions run yet" dead-end.
+4. **WebUI three-way mode control** — Rich (private) | Thin (private, `mode=thin session=new`) | Thin (mirror panel). Previously thin existed only as the panel mirror.
+5. **Container e2e extended** — click-to-view, private-thin-session and `nav` assertions pin all of the above.
 
 ### Phase 3: Panel opt-in
 
