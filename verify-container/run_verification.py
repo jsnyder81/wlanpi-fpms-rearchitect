@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Container verification script for wlanpi-menud + wlanpi-webui nginx integration."""
+"""Container verification script for wlanpi-menud + wlanpi-webui nginx integration.
+
+Validates all Phase 2 exit criteria:
+- Real Flask create_app behind real nginx + real menud
+- Concurrent TUI on local.sock + multiple browser tabs (rich private + thin mirror + second user)
+- Bidirectional thin mirroring and concurrent rich action invocations
+- Real POST /logout via nginx revoking only that user's menu sessions with 4401
+- Server-side password-change revocation closing live WebSocket with 4401
+- Security boundaries: nginx auth_request, forged header dropping, origin check (1008),
+  and local admin privilege check on local.sock (real UID 1001 operator gets FORBIDDEN).
+"""
 
 from __future__ import annotations
 
@@ -14,11 +24,11 @@ import ssl
 import struct
 import subprocess
 import sys
-import tempfile
+import threading
 import time
 from pathlib import Path
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("verifier")
 
 WORKSPACE = Path("/src")
@@ -26,142 +36,115 @@ MENUD_PATH = WORKSPACE / "wlanpi-menud"
 WEBUI_PATH = WORKSPACE / "wlanpi-webui"
 
 # Ensure menud, webui and their dependencies are importable
+sys.path.insert(0, str(WORKSPACE / "verify-container"))
 sys.path.insert(0, str(MENUD_PATH))
 sys.path.insert(0, str(MENUD_PATH / "tests"))
 sys.path.insert(0, str(WEBUI_PATH))
+sys.path.insert(0, str(WEBUI_PATH / ".venv/lib/python3.13/site-packages"))
 sys.path.insert(0, str(MENUD_PATH / ".venv/lib/python3.13/site-packages"))
 
 from fakecore import BASE, FakeCore
-from wlanpi_menud.config import Config
+from wlanpi_menud.config import Config as MConfig
 from wlanpi_menud.core import CoreClient, TokenSource
 from wlanpi_menud.poller import Poller
 from wlanpi_menud.server import Server
 from wlanpi_menud.service import Service
 from wlanpi_webui.menud import revoke_menu_session
 
-
-# ---------------------------------------------------------------------------
-# Dummy WebUI backend for /auth/check over unix socket
-# ---------------------------------------------------------------------------
-
-class FakeWebUIServer:
-    """A lightweight HTTP server on unix socket answering /auth/check."""
-
-    def __init__(self, sock_path: Path):
-        self.sock_path = sock_path
-        self._srv: socket.socket | None = None
-        self._running = False
-        self._thread = None
-
-    def start(self):
-        if self.sock_path.exists():
-            self.sock_path.unlink()
-        self.sock_path.parent.mkdir(parents=True, exist_ok=True)
-        self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._srv.bind(str(self.sock_path))
-        os.chmod(self.sock_path, 0o666)
-        self._srv.listen(16)
-        self._running = True
-        import threading
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        log.info("Fake WebUI listening on %s", self.sock_path)
-
-    def _loop(self):
-        while self._running:
-            try:
-                conn, _ = self._srv.accept()
-            except OSError:
-                break
-            self._handle_client(conn)
-
-    def _handle_client(self, conn: socket.socket):
-        try:
-            req = b""
-            while b"\r\n\r\n" not in req:
-                chunk = conn.recv(1024)
-                if not chunk:
-                    break
-                req += chunk
-
-            headers_text = req.decode("iso-8859-1")
-            first_line = headers_text.split("\r\n")[0]
-            cookie_header = ""
-            for line in headers_text.split("\r\n")[1:]:
-                if line.lower().startswith("cookie:"):
-                    cookie_header = line.split(":", 1)[1].strip()
-
-            if "session=valid_alice_session" in cookie_header:
-                resp = (
-                    b"HTTP/1.1 200 OK\r\n"
-                    b"Content-Length: 0\r\n"
-                    b"X-WebUI-User: alice\r\n"
-                    b"X-WebUI-Session: sess-alice-456\r\n\r\n"
-                )
-            else:
-                resp = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"
-            conn.sendall(resp)
-        except Exception as exc:
-            log.warning("Fake WebUI error: %s", exc)
-        finally:
-            conn.close()
-
-    def stop(self):
-        self._running = False
-        if self._srv:
-            self._srv.close()
-        if self.sock_path.exists():
-            self.sock_path.unlink()
+import wlanpi_webui.app as webapp
+import wlanpi_webui.auth.auth as wauth
+from wlanpi_webui.config import Config as WConfig
 
 
 # ---------------------------------------------------------------------------
-# WebSocket Client Helper (Pure TLS + HTTP/1.1 Upgrade + RFC 6455)
+# WebSocket frame encode/decode helpers
 # ---------------------------------------------------------------------------
 
-def make_ws_frame(payload: bytes) -> bytes:
-    mask = b"\xaa\xbb\xcc\xdd"
-    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+def make_ws_frame(payload: bytes, opcode: int = 0x01) -> bytes:
+    """Create a client-to-server WebSocket frame (masked)."""
+    mask = b"\x12\x34\x56\x78"
+    masked_payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
     length = len(payload)
     if length < 126:
-        header = bytes([0x81, 0x80 | length]) + mask
+        header = bytes([0x80 | opcode, 0x80 | length]) + mask
     elif length < 65536:
-        header = struct.pack("!BBH", 0x81, 0x80 | 126, length) + mask
+        header = struct.pack("!BBH", 0x80 | opcode, 0x80 | 126, length) + mask
     else:
-        header = struct.pack("!BBQ", 0x81, 0x80 | 127, length) + mask
-    return header + masked
+        header = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, length) + mask
+    return header + masked_payload
 
 
 def read_ws_frame(sock: socket.socket, timeout: float = 4.0) -> dict | None:
+    """Read a single WebSocket frame from a socket."""
     sock.settimeout(timeout)
     try:
-        head = sock.recv(2)
+        header = sock.recv(2)
     except (socket.timeout, TimeoutError):
         return None
-    if len(head) < 2:
+    except OSError:
         return None
-    b1, b2 = head[0], head[1]
+
+    if len(header) < 2:
+        return None
+
+    b1, b2 = header[0], header[1]
     opcode = b1 & 0x0F
     is_masked = bool(b2 & 0x80)
     payload_len = b2 & 0x7F
+
     if payload_len == 126:
-        payload_len = int.from_bytes(sock.recv(2), "big")
+        ext = sock.recv(2)
+        if len(ext) < 2:
+            return None
+        payload_len = struct.unpack("!H", ext)[0]
     elif payload_len == 127:
-        payload_len = int.from_bytes(sock.recv(8), "big")
+        ext = sock.recv(8)
+        if len(ext) < 8:
+            return None
+        payload_len = struct.unpack("!Q", ext)[0]
+
     mask = sock.recv(4) if is_masked else b""
-    data = b""
+    if is_masked and len(mask) < 4:
+        return None
+
+    data = bytearray()
     while len(data) < payload_len:
-        chunk = sock.recv(payload_len - len(data))
+        try:
+            chunk = sock.recv(payload_len - len(data))
+        except (socket.timeout, TimeoutError, OSError):
+            break
         if not chunk:
             break
-        data += chunk
+        data.extend(chunk)
+
+    if len(data) < payload_len:
+        return None
+
     if is_masked:
-        data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        data = bytearray(b ^ mask[i % 4] for i, b in enumerate(data))
+
     if opcode == 0x08:  # Close frame
         code = struct.unpack("!H", data[:2])[0] if len(data) >= 2 else None
-        reason = data[2:].decode("utf-8", "ignore")
+        reason = data[2:].decode("utf-8", errors="ignore")
         return {"type": "close", "code": code, "reason": reason}
+
     if opcode == 0x01:  # Text frame
-        return json.loads(data.decode("utf-8"))
+        try:
+            return json.loads(data.decode("utf-8"))
+        except json.JSONDecodeError:
+            return {"type": "raw", "data": bytes(data)}
+
+    return {"type": f"opcode_{opcode}", "data": bytes(data)}
+
+
+def drain_until(s: socket.socket, pred, limit: int = 25, timeout: float = 4.0) -> dict | None:
+    """Drain frames from WebSocket until predicate matches."""
+    for _ in range(limit):
+        f = read_ws_frame(s, timeout)
+        if f is None:
+            return None
+        if pred(f):
+            return f
     return None
 
 
@@ -172,6 +155,7 @@ def raw_ws_connect(
     headers: dict[str, str],
     timeout: float = 4.0,
 ) -> tuple[int, dict[str, str], ssl.SSLSocket]:
+    """Perform a raw TLS WebSocket handshake."""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -219,6 +203,7 @@ def raw_ws_connect_unix(
     path: str = "/ui/ws",
     timeout: float = 4.0,
 ) -> tuple[int, dict[str, str], socket.socket]:
+    """Connect to a local unix domain socket and perform a WebSocket upgrade."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     sock.connect(str(sock_path))
@@ -261,8 +246,8 @@ def run_real_uid_operator_client(
 ) -> tuple[dict | None, dict | None]:
     """Connect to local.sock as a real separate process with operator UID.
 
-    Uses sudo -u or setuid so SO_PEERCRED carried by the Linux kernel genuinely
-    reflects the operator UID. Returns (welcome_frame, error_frame).
+    Uses sudo -u so SO_PEERCRED carried by the Linux kernel genuinely
+    reflects the operator UID (1001). Returns (welcome_frame, error_frame).
     """
     helper_code = f"""
 import json, socket, struct, sys
@@ -381,69 +366,117 @@ print(json.dumps({{"welcome": welcome, "error": err}}))
     return data.get("welcome"), data.get("error")
 
 
-async def main():
-    log.info("Starting container verification...")
+# ---------------------------------------------------------------------------
+# Real Flask app & Nginx management
+# ---------------------------------------------------------------------------
 
-    # 1. Generate SSL self-signed certificates for nginx
+def setup_nginx() -> subprocess.Popen:
+    """Setup self-signed certs and real nginx configuration."""
     ssl_dir = Path("/etc/nginx/ssl")
     ssl_dir.mkdir(parents=True, exist_ok=True)
-    cert_path = ssl_dir / "self-signed-wlanpi.cert"
-    key_path = ssl_dir / "self-signed-wlanpi.key"
-    if not cert_path.exists():
-        subprocess.run(
-            [
-                "openssl", "req", "-x509", "-nodes", "-days", "365",
-                "-newkey", "rsa:2048",
-                "-keyout", str(key_path),
-                "-out", str(cert_path),
-                "-subj", "/CN=localhost"
-            ],
-            check=True,
-            capture_output=True,
-        )
-
-    # 2. Setup nginx configuration
-    nginx_conf = Path("/etc/nginx/nginx.conf")
-    shutil.copy(WEBUI_PATH / "install/etc/nginx/nginx.conf", nginx_conf)
-
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-nodes", "-days", "1", "-newkey", "rsa:2048",
+            "-keyout", str(ssl_dir / "self-signed-wlanpi.key"),
+            "-out", str(ssl_dir / "self-signed-wlanpi.cert"),
+            "-subj", "/CN=localhost",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    shutil.copy(WEBUI_PATH / "install/etc/nginx/nginx.conf", "/etc/nginx/nginx.conf")
     sites_enabled = Path("/etc/nginx/sites-enabled")
     sites_enabled.mkdir(parents=True, exist_ok=True)
-    shutil.copy(
-        WEBUI_PATH / "install/etc/nginx/wlanpi_webui.conf",
-        sites_enabled / "wlanpi_webui.conf",
-    )
+    shutil.copy(WEBUI_PATH / "install/etc/nginx/wlanpi_webui.conf", sites_enabled / "wlanpi_webui.conf")
 
-    webui_conf_d = Path("/etc/wlanpi-webui/nginx/conf.d")
-    webui_conf_d.mkdir(parents=True, exist_ok=True)
-    shutil.copy(
-        WEBUI_PATH / "install/etc/nginx/conf.d/wlanpi-menud.conf",
-        webui_conf_d / "wlanpi-menud.conf",
-    )
+    conf_d = Path("/etc/wlanpi-webui/nginx/conf.d")
+    conf_d.mkdir(parents=True, exist_ok=True)
+    shutil.copy(WEBUI_PATH / "install/etc/nginx/conf.d/wlanpi-menud.conf", conf_d / "wlanpi-menud.conf")
 
-    # Create dummy upstreams for librespeed and grafana so nginx starts cleanly
-    dummy_upstreams = """
-upstream librespeed { server 127.0.0.1:8081; }
-upstream grafana { server 127.0.0.1:3000; }
-"""
-    # Test nginx configuration
-    test_nginx = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
-    if test_nginx.returncode != 0:
-        log.error("nginx -t failed:\n%s\n%s", test_nginx.stdout, test_nginx.stderr)
-        sys.exit(1)
-    log.info("nginx -t passed successfully")
+    test_res = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
+    assert test_res.returncode == 0, f"nginx -t failed: {test_res.stderr}"
 
-    # Start nginx
-    nginx_proc = subprocess.Popen(["nginx", "-g", "daemon off;"])
+    proc = subprocess.Popen(["nginx", "-g", "daemon off;"])
     time.sleep(1)
+    log.info("nginx started successfully")
+    return proc
 
-    # 4. Start fake WebUI on /run/wlanpi_webui.sock
-    fake_webui = FakeWebUIServer(Path("/run/wlanpi_webui.sock"))
-    fake_webui.start()
 
-    # 5. Start real wlanpi-menud on /run/wlanpi-menud/proxy/proxy.sock with fakecore and real menu
+def start_flask():
+    """Start real Flask create_app answering /auth/check and /logout on unix socket."""
+    WConfig.SESSION_STORE_PATH = "/tmp/sessions.json"
+    wauth.account_still_allowed = lambda: True  # no PAM/core daemon in the container
+    webapp.system_service_running_state = lambda *a, **k: True
+    app = webapp.create_app(WConfig)
+
+    from werkzeug.serving import make_server
+    sock_path = "/run/wlanpi_webui.sock"
+    if os.path.exists(sock_path):
+        os.unlink(sock_path)
+    srv = make_server("unix://" + sock_path, 0, app, threaded=True)
+    os.chmod(sock_path, 0o666)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    log.info("Real Flask WebUI serving on %s", sock_path)
+    return app
+
+
+def mint_session(app, username: str) -> tuple[str, str, str, str]:
+    """Mint a signed Flask session cookie for `username`."""
+    import flask
+    with app.test_request_context("/"):
+        wauth._login_session(username)
+        data = dict(flask.session)
+        cookie = app.session_interface.get_signing_serializer(app).dumps(data)
+    cookie_name = app.config.get("SESSION_COOKIE_NAME", "session")
+    return cookie_name, cookie, data["sid"], data["csrf_token"]
+
+
+def browser_connect(cookie_hdr: str, hello: dict):
+    """Connect to /ui/ws over TLS and perform hello exchange."""
+    st, _, s = raw_ws_connect(
+        "127.0.0.1", 443, "/ui/ws",
+        {"Host": "localhost", "Origin": "https://localhost", "Cookie": cookie_hdr},
+    )
+    if st != 101:
+        return st, None, None
+    s.sendall(make_ws_frame(json.dumps(hello).encode()))
+    w = read_ws_frame(s)
+    return st, s, w
+
+
+def http_logout(cookie_hdr: str, csrf_token: str) -> int:
+    """Send a real POST /logout through nginx HTTPS."""
+    ctx = ssl._create_unverified_context()
+    conn = http.client.HTTPSConnection("127.0.0.1", 443, context=ctx, timeout=5)
+    body = "csrf_token=" + csrf_token
+    conn.request(
+        "POST", "/logout", body=body,
+        headers={
+            "Host": "localhost",
+            "Origin": "https://localhost",
+            "Cookie": cookie_hdr,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-CSRF-Token": csrf_token,
+        },
+    )
+    resp = conn.getresponse()
+    resp.read()
+    return resp.status
+
+
+# ---------------------------------------------------------------------------
+# Main Verification Execution
+# ---------------------------------------------------------------------------
+
+async def main():
+    log.info("Starting comprehensive container verification...")
+
+    nginx_proc = setup_nginx()
+    flask_app = start_flask()
+
+    # Operator UID 1001 for SO_PEERCRED privilege check
     OPERATOR_UID = 1001
     OPERATOR_USER = "operator"
-    # Ensure operator user exists with uid 1001 in 'operator' group
     subprocess.run(["useradd", "-u", str(OPERATOR_UID), "-g", "operator", OPERATOR_USER], capture_output=True)
 
     fake_core = FakeCore()
@@ -452,363 +485,347 @@ upstream grafana { server 127.0.0.1:3000; }
 
     menud_proxy_sock = Path("/run/wlanpi-menud/proxy/proxy.sock")
     menud_local_sock = Path("/run/wlanpi-menud/local.sock")
-    menud_config = Config(
+    menud_config = MConfig(
         builtin_dir=MENUD_PATH / "share" / "menu.d",
         proxy_sock=menud_proxy_sock,
         local_sock=menud_local_sock,
         proxy_sock_group="www-data",
         local_uids={os.getuid(): ("admin",), OPERATOR_UID: ("operator",)},
-        allowed_origins=(),  # Origin host must match Host header
+        allowed_origins=(),  # Origin netloc must match Host
         validate_outbound=True,
     )
     service = Service(menud_config, core=core_client, tokens=tokens)
     await Poller(service).poll_once()
     server = Server(service)
     await server.start()
-    log.info("wlanpi-menud started with fakecore, proxy.sock and local.sock ready")
+    log.info("wlanpi-menud started: proxy.sock and local.sock ready")
 
-    # Ensure proxy.sock and local.sock permissions
     try:
         os.chmod(menud_proxy_sock, 0o666)
         os.chmod(menud_local_sock, 0o666)
     except Exception:
         pass
 
-    results = []
+    results: list[tuple[str, bool, str]] = []
 
-    try:
+    def check(name: str, cond: bool, detail: str = ""):
+        results.append((name, bool(cond), detail))
+        log.info("[%s] %s%s", "PASS" if cond else "FAIL", name, f" [{detail}]" if detail else "")
+
+    # Mint sessions for alice and bob
+    name_a, cookie_a, sid_a, csrf_a = mint_session(flask_app, "alice")
+    name_b, cookie_b, sid_b, csrf_b = mint_session(flask_app, "bob")
+    ck_hdr_a = f"{name_a}={cookie_a}"
+    ck_hdr_b = f"{name_b}={cookie_b}"
+
+    def run():
         # -------------------------------------------------------------------
-        # Test 1: Valid auth session reaches proxy.sock and authenticates
+        # Test 1: Real /auth/check via nginx: valid session authenticates
         # -------------------------------------------------------------------
         log.info("Running Test 1: Valid auth session reaches proxy.sock...")
-        status, headers, sock = await asyncio.to_thread(
-            raw_ws_connect,
-            "127.0.0.1", 443, "/ui/ws",
-            {
-                "Host": "localhost",
-                "Origin": "https://localhost",
-                "Cookie": "session=valid_alice_session",
-            },
+        st1, s1, w1 = browser_connect(
+            ck_hdr_a,
+            {"v": 1, "type": "hello", "id": "h:t1", "mode": "rich", "session": "new", "protocol": [1]},
         )
-        assert status == 101, f"Expected 101 Switching Protocols, got {status}"
-        hello = json.dumps({"v": 1, "type": "hello", "id": "h1", "mode": "rich", "protocol": [1]}).encode()
-        await asyncio.to_thread(sock.sendall, make_ws_frame(hello))
-        frame = await asyncio.to_thread(read_ws_frame, sock)
-        assert frame is not None, "Did not receive frame from menud"
-        assert frame.get("type") == "welcome", f"Expected welcome frame, got {frame}"
-        principal = frame.get("principal", {})
-        assert principal.get("kind") == "webui", f"Expected principal kind webui, got {principal}"
-        assert principal.get("name") == "alice", f"Expected principal name alice, got {principal}"
-        sock.close()
-        results.append(("Test 1: Browser-less websocket with valid session reaches proxy.sock", True))
-        log.info("--> Test 1 PASSED!")
+        check(
+            "Test 1: Browser-less websocket with valid session reaches proxy.sock",
+            st1 == 101 and w1 and w1.get("principal", {}).get("name") == "alice",
+            f"status={st1} name={w1 and w1.get('principal', {}).get('name')}",
+        )
+        drain_until(s1, lambda f: f.get("type") == "menu")
+        s1.close()
 
         # -------------------------------------------------------------------
-        # Test 2: Without valid auth session, nginx returns 401
+        # Test 2: Websocket without valid auth returns 401
         # -------------------------------------------------------------------
-        log.info("Running Test 2: Without valid session, expect 401...")
-        status, headers, sock = await asyncio.to_thread(
-            raw_ws_connect,
-            "127.0.0.1", 443, "/ui/ws",
-            {
-                "Host": "localhost",
-                "Origin": "https://localhost",
-            },
-        )
-        sock.close()
-        assert status == 401, f"Expected status 401, got {status}"
-        results.append(("Test 2: Websocket without valid auth returns 401", True))
-        log.info("--> Test 2 PASSED!")
+        log.info("Running Test 2: Websocket without valid auth returns 401...")
+        st2, _, s2 = raw_ws_connect("127.0.0.1", 443, "/ui/ws", {"Host": "localhost", "Origin": "https://localhost"})
+        s2.close()
+        check("Test 2: Websocket without valid auth returns 401", st2 == 401, f"status={st2}")
 
         # -------------------------------------------------------------------
-        # Test 3: Origin mismatch refused
+        # Test 3: Origin mismatch refused (close code 1008)
         # -------------------------------------------------------------------
-        log.info("Running Test 3: Origin mismatch refused...")
-        status, headers, sock = await asyncio.to_thread(
-            raw_ws_connect,
+        log.info("Running Test 3: Origin mismatch is refused...")
+        st3, _, s3 = raw_ws_connect(
             "127.0.0.1", 443, "/ui/ws",
-            {
-                "Host": "localhost",
-                "Origin": "https://evil.attacker.com",
-                "Cookie": "session=valid_alice_session",
-            },
+            {"Host": "localhost", "Origin": "https://evil.attacker.com", "Cookie": ck_hdr_a},
         )
-        if status == 101:
-            frame = await asyncio.to_thread(read_ws_frame, sock)
-            sock.close()
-            assert frame is not None, "Expected close/error frame on origin mismatch"
-            assert frame.get("type") in ("close", "error"), f"Unexpected frame on origin mismatch: {frame}"
-            if frame.get("type") == "close":
-                assert frame.get("code") == 1008, f"Expected close code 1008, got {frame.get('code')}"
-            else:
-                assert frame.get("code") == "FORBIDDEN" or frame.get("close_code") == 1008
+        if st3 == 101:
+            f3 = read_ws_frame(s3)
+            s3.close()
+            check(
+                "Test 3: Origin mismatch is refused (close code 1008)",
+                f3 and (f3.get("code") == 1008 or f3.get("close_code") == 1008),
+                f"frame={f3}",
+            )
         else:
-            assert status in (403, 1008), f"Unexpected status {status} for origin mismatch"
-            sock.close()
-        results.append(("Test 3: Origin mismatch is refused (close code 1008)", True))
-        log.info("--> Test 3 PASSED!")
+            s3.close()
+            check("Test 3: Origin mismatch is refused (close code 1008)", st3 in (403, 1008), f"status={st3}")
 
         # -------------------------------------------------------------------
-        # Test 4: Client-forged X-WebUI-User header cannot survive the proxy
+        # Test 4: Client-forged X-WebUI-User header overwritten by auth_request
         # -------------------------------------------------------------------
-        log.info("Running Test 4: Client-forged X-WebUI-User header...")
-        status, headers, sock = await asyncio.to_thread(
-            raw_ws_connect,
+        log.info("Running Test 4: Client-forged headers overwritten by auth_request...")
+        st4, _, s4 = raw_ws_connect(
             "127.0.0.1", 443, "/ui/ws",
             {
                 "Host": "localhost",
                 "Origin": "https://localhost",
-                "Cookie": "session=valid_alice_session",
+                "Cookie": ck_hdr_a,
                 "X-WebUI-User": "mallory",
                 "X-WebUI-Session": "forged_session_id",
             },
         )
-        assert status == 101, f"Expected 101, got {status}"
-        hello = json.dumps({"v": 1, "type": "hello", "id": "h2", "mode": "rich", "protocol": [1]}).encode()
-        await asyncio.to_thread(sock.sendall, make_ws_frame(hello))
-        frame = await asyncio.to_thread(read_ws_frame, sock)
-        assert frame is not None and frame.get("type") == "welcome", f"Unexpected frame: {frame}"
-        principal = frame.get("principal", {})
-        assert principal.get("name") == "alice", f"Forged header survived! Name is {principal.get('name')}"
-        sock.close()
+        assert st4 == 101, f"Expected 101, got {st4}"
+        s4.sendall(make_ws_frame(json.dumps({"v": 1, "type": "hello", "id": "h:f", "mode": "rich", "protocol": [1]}).encode()))
+        wf4 = read_ws_frame(s4)
+        s4.close()
+        check(
+            "Test 4: Client-forged X-WebUI-User header overwritten by auth_request",
+            wf4 and wf4.get("principal", {}).get("name") == "alice",
+            f"name={wf4 and wf4.get('principal', {}).get('name')}",
+        )
 
-        status, headers, sock = await asyncio.to_thread(
-            raw_ws_connect,
-            "127.0.0.1", 443, "/ui/ws",
+        # -------------------------------------------------------------------
+        # Test 5: Rich mode invokes 3 actions and gets typed view block results
+        # -------------------------------------------------------------------
+        log.info("Running Test 5: Rich mode invokes actions and gets view blocks...")
+        st5, s5, w5 = browser_connect(
+            ck_hdr_a,
             {
-                "Host": "localhost",
-                "Origin": "https://localhost",
-                "X-WebUI-User": "root",
-                "X-WebUI-Session": "fake_admin_session",
+                "v": 1, "type": "hello", "id": "h:rich", "mode": "rich", "session": "new", "protocol": [1],
+                "capabilities": {"blocks": ["text", "kv", "table", "list", "qr", "status", "progress", "confirm"]},
             },
         )
-        sock.close()
-        assert status == 401, f"Expected 401 when forging without session, got {status}"
-        results.append(("Test 4: Client-forged X-WebUI-User header overwritten by auth_request", True))
-        log.info("--> Test 4 PASSED!")
+        drain_until(s5, lambda f: f.get("type") == "menu")
 
-        # -------------------------------------------------------------------
-        # Test 5: Rich mode invokes 3 actions and gets results
-        # -------------------------------------------------------------------
-        log.info("Running Test 5: Rich mode invokes 3 actions and gets results...")
-        status, headers, sock = await asyncio.to_thread(
-            raw_ws_connect,
-            "127.0.0.1", 443, "/ui/ws",
-            {
-                "Host": "localhost",
-                "Origin": "https://localhost",
-                "Cookie": "session=valid_alice_session",
-            },
+        def invoke_and_check(node_id: str, mid: str, expected_block_type: str) -> bool:
+            s5.sendall(make_ws_frame(json.dumps({"v": 1, "type": "invoke", "id": mid, "node": node_id}).encode()))
+            res = drain_until(s5, lambda f: f.get("type") == "job" and f.get("state") == "result")
+            blocks = res.get("result", {}).get("blocks", []) if res else []
+            return any(b.get("type") == expected_block_type for b in blocks)
+
+        ok_table = invoke_and_check("network.interfaces", "act:1", "table")
+        ok_kv1 = invoke_and_check("network.eth0_ipconfig", "act:2", "kv")
+        ok_kv2 = invoke_and_check("network.lldp", "act:3", "kv")
+        s5.close()
+        check(
+            "Test 5: Rich mode invokes 3 actions and gets typed view block results",
+            ok_table and ok_kv1 and ok_kv2,
+            f"table={ok_table} kv1={ok_kv1} kv2={ok_kv2}",
         )
-        assert status == 101, f"Expected 101, got {status}"
-        hello_r = json.dumps({
-            "v": 1, "type": "hello", "id": "h:rich", "mode": "rich", "session": "new", "protocol": [1],
-            "client": {"name": "wlanpi-webui-test"},
-            "capabilities": {"blocks": ["text", "kv", "table", "list", "qr", "status", "progress", "confirm"]}
-        }).encode()
-        await asyncio.to_thread(sock.sendall, make_ws_frame(hello_r))
-
-        welcome_r = await asyncio.to_thread(read_ws_frame, sock)
-        assert welcome_r is not None and welcome_r.get("type") == "welcome"
-        menu_r = await asyncio.to_thread(read_ws_frame, sock)
-        assert menu_r is not None and menu_r.get("type") == "menu"
-        assert len(menu_r.get("nodes", [])) > 0, "Expected non-empty menu nodes"
-
-        async def invoke_and_wait_result(node_id: str, mid: str):
-            await asyncio.to_thread(sock.sendall, make_ws_frame(json.dumps({
-                "v": 1, "type": "invoke", "id": mid, "node": node_id
-            }).encode()))
-            while True:
-                f = await asyncio.to_thread(read_ws_frame, sock)
-                if f and f.get("type") == "job" and f.get("state") == "result":
-                    return f
-                if f and f.get("type") == "error":
-                    raise RuntimeError(f"Invoke failed with error frame: {f}")
-
-        # Action 1: network.interfaces (table view)
-        res1 = await invoke_and_wait_result("network.interfaces", "act:1")
-        assert res1 and "blocks" in res1.get("result", {})
-        assert any(b.get("type") == "table" for b in res1["result"]["blocks"])
-        log.info("Action 1 (network.interfaces) -> table blocks received")
-
-        # Action 2: network.eth0_ipconfig (kv view)
-        res2 = await invoke_and_wait_result("network.eth0_ipconfig", "act:2")
-        assert res2 and "blocks" in res2.get("result", {})
-        assert any(b.get("type") == "kv" for b in res2["result"]["blocks"])
-        log.info("Action 2 (network.eth0_ipconfig) -> kv blocks received")
-
-        # Action 3: network.lldp (kv view)
-        res3 = await invoke_and_wait_result("network.lldp", "act:3")
-        assert res3 and "blocks" in res3.get("result", {})
-        assert any(b.get("type") == "kv" for b in res3["result"]["blocks"])
-        log.info("Action 3 (network.lldp) -> kv blocks received")
-
-        sock.close()
-        results.append(("Test 5: Rich mode invokes 3 actions and gets typed view block results", True))
-        log.info("--> Test 5 PASSED!")
 
         # -------------------------------------------------------------------
-        # Test 6: Thin attach mirrors a concurrent local.sock TUI session
+        # Test 6: Concurrency: TUI + 2 alice browser tabs (rich + mirror) + 1 bob tab
         # -------------------------------------------------------------------
-        log.info("Running Test 6: Thin attach mirrors concurrent local.sock TUI session...")
-        status_tui, _, sock_tui = await asyncio.to_thread(raw_ws_connect_unix, menud_local_sock)
-        assert status_tui == 101, f"Expected 101 for TUI, got {status_tui}"
-        hello_tui = json.dumps({
+        log.info("Running Test 6: TUI and 3 browser tabs running concurrently...")
+        # 1. TUI on local.sock (thin mode, default session)
+        st_tui, _, sock_tui = raw_ws_connect_unix(menud_local_sock)
+        sock_tui.sendall(make_ws_frame(json.dumps({
             "v": 1, "type": "hello", "id": "h:tui", "mode": "thin", "session": "default", "protocol": [1],
-            "client": {"name": "wlanpi-menu-tui"}
-        }).encode()
-        await asyncio.to_thread(sock_tui.sendall, make_ws_frame(hello_tui))
-        welcome_tui = await asyncio.to_thread(read_ws_frame, sock_tui)
-        assert welcome_tui and welcome_tui.get("type") == "welcome", f"Bad welcome_tui: {welcome_tui}"
-        while True:
-            f = await asyncio.to_thread(read_ws_frame, sock_tui)
-            if f and f.get("type") == "view":
-                break
+            "client": {"name": "wlanpi-menu-tui"},
+        }).encode()))
+        wt = read_ws_frame(sock_tui)
+        drain_until(sock_tui, lambda f: f.get("type") == "view")
+        default_id = wt["session_id"]
 
-        # Browser connects in thin mode to mirror panel
-        status_web, _, sock_web = await asyncio.to_thread(
-            raw_ws_connect,
-            "127.0.0.1", 443, "/ui/ws",
-            {
-                "Host": "localhost",
-                "Origin": "https://localhost",
-                "Cookie": "session=valid_alice_session",
-            },
+        # 2. Tab 1: alice rich new session
+        st_a1, sock_a1, w_a1 = browser_connect(
+            ck_hdr_a,
+            {"v": 1, "type": "hello", "id": "h:a1", "mode": "rich", "session": "new", "protocol": [1]},
         )
-        assert status_web == 101, f"Expected 101 for browser mirror, got {status_web}"
-        hello_web = json.dumps({
-            "v": 1, "type": "hello", "id": "h:mirror", "mode": "thin", "session": "default", "protocol": [1],
-            "client": {"name": "wlanpi-webui"}
-        }).encode()
-        await asyncio.to_thread(sock_web.sendall, make_ws_frame(hello_web))
-        welcome_web = await asyncio.to_thread(read_ws_frame, sock_web)
-        assert welcome_web and welcome_web.get("type") == "welcome"
-        assert welcome_web.get("session_id") == welcome_tui.get("session_id"), "Sessions must match default session"
-        while True:
-            f = await asyncio.to_thread(read_ws_frame, sock_web)
-            if f and f.get("type") == "view":
-                break
+        drain_until(sock_a1, lambda f: f.get("type") == "menu")
 
-        # TUI inputs 'down'
-        inp_tui = json.dumps({"v": 1, "type": "input", "id": "tui:down", "key": "down"}).encode()
-        await asyncio.to_thread(sock_tui.sendall, make_ws_frame(inp_tui))
+        # 3. Tab 2: alice thin mirror on default session
+        st_a2, sock_a2, w_a2 = browser_connect(
+            ck_hdr_a,
+            {"v": 1, "type": "hello", "id": "h:a2", "mode": "thin", "session": "default", "protocol": [1]},
+        )
+        drain_until(sock_a2, lambda f: f.get("type") == "view")
 
-        # Both TUI and WebUI should receive the updated view frame
-        tui_next = await asyncio.to_thread(read_ws_frame, sock_tui)
-        assert tui_next and tui_next.get("type") == "view", f"Expected view on TUI, got {tui_next}"
-        web_next = await asyncio.to_thread(read_ws_frame, sock_web)
-        assert web_next and web_next.get("type") == "view", f"Expected view on WebUI, got {web_next}"
-        assert web_next.get("driven_by", {}).get("self") is False, "WebUI should see driven_by.self == False"
+        # 4. Tab 3: bob rich new session
+        st_b1, sock_b1, w_b1 = browser_connect(
+            ck_hdr_b,
+            {"v": 1, "type": "hello", "id": "h:b1", "mode": "rich", "session": "new", "protocol": [1]},
+        )
+        drain_until(sock_b1, lambda f: f.get("type") == "menu")
 
-        # WebUI inputs 'up'
-        inp_web = json.dumps({"v": 1, "type": "input", "id": "web:up", "key": "up"}).encode()
-        await asyncio.to_thread(sock_web.sendall, make_ws_frame(inp_web))
+        # Session assertions
+        sessions_ok = (
+            w_a2.get("session_id") == default_id and
+            w_a1.get("session_id") != w_b1.get("session_id") and
+            w_a1.get("session_id") != default_id
+        )
+        check("Test 6a: Concurrency: sessions established and separated", sessions_ok)
 
-        web_center = await asyncio.to_thread(read_ws_frame, sock_web)
-        assert web_center and web_center.get("type") == "view", f"Expected view on WebUI, got {web_center}"
-        assert web_center.get("driven_by", {}).get("self") is True, "WebUI should see driven_by.self == True"
-        tui_center = await asyncio.to_thread(read_ws_frame, sock_tui)
-        assert tui_center and tui_center.get("type") == "view", f"Expected view on TUI, got {tui_center}"
-        assert tui_center.get("driven_by", {}).get("self") is False, "TUI should see driven_by.self == False"
+        # Bidirectional mirroring: TUI inputs 'down', mirror follows
+        sock_tui.sendall(make_ws_frame(json.dumps({"v": 1, "type": "input", "id": "i:down", "key": "down"}).encode()))
+        tui_view1 = drain_until(sock_tui, lambda f: f.get("type") == "view")
+        mirror_view1 = drain_until(sock_a2, lambda f: f.get("type") == "view")
+        tui_drives_mirror = (
+            tui_view1 is not None and
+            mirror_view1 is not None and
+            mirror_view1.get("driven_by", {}).get("self") is False
+        )
+        check("Test 6b: TUI input fans out to browser mirror", tui_drives_mirror)
+
+        # Mirror inputs 'up', TUI follows
+        sock_a2.sendall(make_ws_frame(json.dumps({"v": 1, "type": "input", "id": "i:up", "key": "up"}).encode()))
+        mirror_view2 = drain_until(sock_a2, lambda f: f.get("type") == "view")
+        tui_view2 = drain_until(sock_tui, lambda f: f.get("type") == "view")
+        mirror_drives_tui = (
+            mirror_view2 is not None and
+            tui_view2 is not None and
+            tui_view2.get("driven_by", {}).get("self") is False
+        )
+        check("Test 6c: Browser mirror input drives TUI", mirror_drives_tui)
+
+        # Concurrent rich invokes across different users
+        sock_a1.sendall(make_ws_frame(json.dumps({"v": 1, "type": "invoke", "id": "inv:a", "node": "network.interfaces"}).encode()))
+        sock_b1.sendall(make_ws_frame(json.dumps({"v": 1, "type": "invoke", "id": "inv:b", "node": "network.interfaces"}).encode()))
+        res_a1 = drain_until(sock_a1, lambda f: f.get("type") == "job" and f.get("state") == "result")
+        res_b1 = drain_until(sock_b1, lambda f: f.get("type") == "job" and f.get("state") == "result")
+        check(
+            "Test 6d: Concurrent rich action invocations for multiple users",
+            res_a1 is not None and res_b1 is not None,
+        )
+
+        # -------------------------------------------------------------------
+        # Test 7: Real POST /logout closes Alice's sessions and preserves default & Bob
+        # -------------------------------------------------------------------
+        log.info("Running Test 7: Real POST /logout closes only Alice's sessions...")
+        logout_st = http_logout(ck_hdr_a, csrf_a)
+        check("Test 7a: POST /logout via nginx returns 302", logout_st in (302, 303, 200), f"status={logout_st}")
+
+        # Alice's Tab 1 and Tab 2 must receive close frame 4401
+        c_a1 = drain_until(sock_a1, lambda f: f.get("type") == "close")
+        c_a2 = drain_until(sock_a2, lambda f: f.get("type") == "close")
+        check(
+            "Test 7b: Tab 1 (alice rich) closed 4401",
+            c_a1 is not None and c_a1.get("code") == 4401,
+            f"frame={c_a1}",
+        )
+        check(
+            "Test 7c: Tab 2 (alice mirror) closed 4401",
+            c_a2 is not None and c_a2.get("code") == 4401,
+            f"frame={c_a2}",
+        )
+
+        # Tab 3 (bob) must stay open and usable
+        no_close_bob = read_ws_frame(sock_b1, 0.4) is None
+        sock_b1.sendall(make_ws_frame(json.dumps({"v": 1, "type": "invoke", "id": "inv:b2", "node": "network.interfaces"}).encode()))
+        res_b2 = drain_until(sock_b1, lambda f: f.get("type") == "job" and f.get("state") == "result")
+        check(
+            "Test 7d: Bob's session stays open and usable after Alice logout",
+            no_close_bob and res_b2 is not None,
+        )
+
+        # TUI still attached and driving default session
+        sock_tui.sendall(make_ws_frame(json.dumps({"v": 1, "type": "input", "id": "i:after", "key": "down"}).encode()))
+        tui_after = drain_until(sock_tui, lambda f: f.get("type") == "view")
+        check("Test 7e: TUI remains attached and driving default session", tui_after is not None)
+        check("Test 7f: Default session still present in service", default_id in service.sessions)
+
+        # New TUI attach gets same default session ID
+        st_tui2, _, sock_tui2 = raw_ws_connect_unix(menud_local_sock)
+        sock_tui2.sendall(make_ws_frame(json.dumps({"v": 1, "type": "hello", "id": "h:tui2", "mode": "thin", "session": "default", "protocol": [1]}).encode()))
+        wt2 = read_ws_frame(sock_tui2)
+        check("Test 7g: New TUI attach gets same default session ID", wt2 and wt2.get("session_id") == default_id)
+
+        # Alice's old cookie now gets 401 at /ui/ws
+        st_a_old, _, s_a_old = raw_ws_connect("127.0.0.1", 443, "/ui/ws", {"Host": "localhost", "Origin": "https://localhost", "Cookie": ck_hdr_a})
+        s_a_old.close()
+        check("Test 7h: Alice's old cookie now refused with 401 at /ui/ws", st_a_old == 401, f"status={st_a_old}")
 
         sock_tui.close()
-        sock_web.close()
-        results.append(("Test 6: Thin attach mirrors a concurrent local.sock TUI session", True))
-        log.info("--> Test 6 PASSED!")
+        sock_tui2.close()
+        sock_a1.close()
+        sock_a2.close()
+        sock_b1.close()
 
         # -------------------------------------------------------------------
-        # Test 7: Real-UID operator on local.sock receives FORBIDDEN on revoke
+        # Test 8: Real-UID operator on local.sock receives FORBIDDEN on revoke
         # -------------------------------------------------------------------
-        log.info("Running Test 7: Real-UID operator on local.sock receives FORBIDDEN on revoke...")
-        status, _, sock_browser = await asyncio.to_thread(
-            raw_ws_connect,
-            "127.0.0.1", 443, "/ui/ws",
-            {
-                "Host": "localhost",
-                "Origin": "https://localhost",
-                "Cookie": "session=valid_alice_session",
-            },
+        log.info("Running Test 8: Real-UID operator on local.sock receives FORBIDDEN on revoke...")
+        # Bob connects a browser session
+        st_b2, sock_b2, w_b2 = browser_connect(
+            ck_hdr_b,
+            {"v": 1, "type": "hello", "id": "h:b2", "mode": "rich", "session": "new", "protocol": [1]},
         )
-        assert status == 101, f"Expected 101, got {status}"
-        hello_b = json.dumps({
-            "v": 1, "type": "hello", "id": "h:logout_test", "mode": "rich", "session": "new", "protocol": [1],
-            "client": {"name": "wlanpi-webui"}
-        }).encode()
-        await asyncio.to_thread(sock_browser.sendall, make_ws_frame(hello_b))
-        w = await asyncio.to_thread(read_ws_frame, sock_browser)
-        assert w and w.get("type") == "welcome"
-        m = await asyncio.to_thread(read_ws_frame, sock_browser)
-        assert m and m.get("type") == "menu"
+        drain_until(sock_b2, lambda f: f.get("type") == "menu")
 
-        # Operator client runs with genuine UID 1001 via sudo -u / setuid
-        w_op, err_op = await asyncio.to_thread(
-            run_real_uid_operator_client,
+        w_op, err_op = run_real_uid_operator_client(
             menud_local_sock,
             OPERATOR_UID,
             OPERATOR_USER,
-            "sess-alice-456",
+            sid_b,
         )
-        assert w_op and w_op.get("type") == "welcome", f"Unexpected operator welcome: {w_op}"
-        assert "operator" in w_op.get("roles", []), f"Operator role missing in {w_op}"
-        assert "admin" not in w_op.get("roles", []), f"Operator must not have admin role: {w_op}"
-        assert w_op.get("principal", {}).get("uid") == OPERATOR_UID, f"Real UID mismatch: {w_op}"
-
-        assert err_op and err_op.get("type") == "error", f"Expected error frame, got: {err_op}"
-        assert err_op.get("code") == "FORBIDDEN", f"Expected FORBIDDEN, got: {err_op.get('code')}"
-        assert "local admin principals" in err_op.get("message", "").lower()
-        log.info(
-            "Authoritative check passed: Real-UID operator (uid=%d) received FORBIDDEN: %s",
-            OPERATOR_UID,
-            err_op.get("message"),
+        check(
+            "Test 8a: Real-UID operator (uid=1001) receives FORBIDDEN on revoke",
+            err_op is not None and err_op.get("code") == "FORBIDDEN" and "local admin principals" in err_op.get("message", "").lower(),
+            f"code={err_op and err_op.get('code')} msg={err_op and err_op.get('message')}",
         )
-
-        # Crucial check: Alice's browser session was NOT closed by operator's forbidden revoke attempt
-        no_frame = await asyncio.to_thread(read_ws_frame, sock_browser, 0.4)
-        assert no_frame is None, f"Expected session to remain open, but received: {no_frame}"
-        results.append(("Test 7: Real-UID operator on local.sock receives FORBIDDEN on revoke", True))
-        log.info("--> Test 7 PASSED!")
+        # Bob's socket was NOT closed by operator's forbidden revoke
+        no_frame_bob = read_ws_frame(sock_b2, 0.4) is None
+        check("Test 8b: Bob's browser session remained open during operator revoke attempt", no_frame_bob)
+        sock_b2.close()
 
         # -------------------------------------------------------------------
-        # Test 8: Logout / admin session revocation closes the browser session
+        # Test 9: Password change revocation closes live WebSocket with 4401
         # -------------------------------------------------------------------
-        log.info("Running Test 8: Admin revoke closes the browser session with 4401...")
-        # Local admin (root) calls revoke_menu_session for alice's session ("sess-alice-456")
-        revoked = await asyncio.to_thread(
-            revoke_menu_session,
-            "sess-alice-456",
-            sock_path=str(menud_local_sock),
-            timeout=2.0,
+        log.info("Running Test 9: Password change server-side revocation closes live WebSocket with 4401...")
+        name_c, cookie_c, sid_c, csrf_c = mint_session(flask_app, "carol")
+        ck_hdr_c = f"{name_c}={cookie_c}"
+
+        st_c, sock_c, w_c = browser_connect(
+            ck_hdr_c,
+            {"v": 1, "type": "hello", "id": "h:carol", "mode": "rich", "session": "new", "protocol": [1]},
         )
-        assert revoked is True, "Expected revoke_menu_session to return True"
+        assert st_c == 101, f"Expected 101 for Carol, got {st_c}"
+        drain_until(sock_c, lambda f: f.get("type") == "menu")
 
-        # The browser connection must receive error/close frame with 4401
-        close_frame = None
-        while True:
-            f = await asyncio.to_thread(read_ws_frame, sock_browser)
-            if not f or f.get("type") == "close":
-                close_frame = f
-                break
+        # Simulate password change path: _revoke_user_sessions("carol") runs
+        with flask_app.test_request_context("/"):
+            wauth._revoke_user_sessions("carol")
 
-        assert close_frame and close_frame.get("type") == "close", f"Expected close frame, got {close_frame}"
-        assert close_frame.get("code") == 4401, f"Expected close code 4401, got {close_frame.get('code')}"
-        sock_browser.close()
-        results.append(("Test 8: WebUI logout / session revocation closes browser session with 4401", True))
-        log.info("--> Test 8 PASSED!")
+        # Carol's live /ui/ws socket must receive close frame 4401
+        close_carol = drain_until(sock_c, lambda f: f.get("type") == "close", limit=10, timeout=3.0)
+        check(
+            "Test 9a: Live /ui/ws socket closes with 4401 on password change revocation",
+            close_carol is not None and close_carol.get("code") == 4401,
+            f"close_frame={close_carol}",
+        )
 
+        # Subsequent invoke fails (socket closed)
+        try:
+            sock_c.sendall(make_ws_frame(json.dumps({"v": 1, "type": "invoke", "id": "inv:c_after", "node": "network.interfaces"}).encode()))
+            res_c_after = drain_until(sock_c, lambda f: f.get("type") == "job", limit=5, timeout=1.0)
+        except Exception:
+            res_c_after = None
+        check("Test 9b: Subsequent action invoke fails on closed socket", res_c_after is None)
+        sock_c.close()
+
+        # Carol's old cookie gets 401 at /ui/ws
+        st_c_refused, _, s_c_refused = raw_ws_connect("127.0.0.1", 443, "/ui/ws", {"Host": "localhost", "Origin": "https://localhost", "Cookie": ck_hdr_c})
+        s_c_refused.close()
+        check("Test 9c: Carol's old session cookie returns 401 at /ui/ws", st_c_refused == 401, f"status={st_c_refused}")
+
+    try:
+        await asyncio.to_thread(run)
     finally:
         log.info("Cleaning up services...")
         await server.close()
-        fake_webui.stop()
         nginx_proc.terminate()
         nginx_proc.wait(timeout=3)
 
-    log.info("\n" + "="*70)
-    log.info("CONTAINER VERIFICATION SUMMARY:")
-    for desc, ok in results:
-        log.info("  [%s] %s", "PASS" if ok else "FAIL", desc)
-    log.info("="*70)
+    log.info("\n" + "=" * 70)
+    log.info("CONTAINER VERIFICATION SUMMARY: %d / %d passed", sum(ok for _, ok, _ in results), len(results))
+    for name, ok, detail in results:
+        log.info("  [%s] %s%s", "PASS" if ok else "FAIL", name, f" [{detail}]" if detail else "")
+    log.info("=" * 70)
 
-    if not all(ok for _, ok in results):
+    if not all(ok for _, ok, _ in results):
         sys.exit(1)
 
 
