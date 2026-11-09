@@ -9,4 +9,5 @@ RUN apt-get update && \
         curl \
         procps \
         sudo \
+        nodejs \
     && rm -rf /var/lib/apt/lists/*

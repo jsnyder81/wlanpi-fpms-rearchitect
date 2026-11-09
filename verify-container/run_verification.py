@@ -618,39 +618,36 @@ async def main():
 
         # -------------------------------------------------------------------
         # Test 5b: Rich click-to-view assertion (single action click renders table without a second click)
+        # Driven via real menu.js through live socket and real Flask page load
         # -------------------------------------------------------------------
-        log.info("Running Test 5b: Rich click-to-view renders table without second click...")
-        st5b, s5b, w5b = browser_connect(
-            ck_hdr_a,
-            {
-                "v": 1, "type": "hello", "id": "h:rich_c2v", "mode": "rich", "session": "new", "protocol": [1],
-                "capabilities": {"blocks": ["text", "kv", "table", "list", "qr", "status", "progress", "confirm"]},
-            },
+        log.info("Running Test 5b: Rich click-to-view renders table without second click (driving real menu.js)...")
+        driver_script = WORKSPACE / "verify-container" / "drive_menu_click.mjs"
+        node_env = {**os.environ, "NODE_TLS_REJECT_UNAUTHORIZED": "0"}
+        res5b_proc = subprocess.run(
+            ["node", "--experimental-websocket", str(driver_script), ck_hdr_a],
+            capture_output=True,
+            text=True,
+            env=node_env,
+            timeout=15,
         )
-        drain_until(s5b, lambda f: f.get("type") == "menu")
+        has_table5b = False
+        prompts5b_count = -1
+        no_second_click_needed = False
+        if res5b_proc.returncode == 0:
+            try:
+                res_json = json.loads(res5b_proc.stdout.strip().splitlines()[-1])
+                has_table5b = bool(res_json.get("table"))
+                prompts5b_count = int(res_json.get("prompts", 0))
+                no_second_click_needed = bool(res_json.get("ok"))
+            except Exception as e:
+                log.error("Failed to parse drive_menu_click output: %s (stdout: %s, stderr: %s)", e, res5b_proc.stdout, res5b_proc.stderr)
+        else:
+            log.error("drive_menu_click failed with rc=%d: stdout=%s stderr=%s", res5b_proc.returncode, res5b_proc.stdout, res5b_proc.stderr)
 
-        # In rich mode, Network > Interfaces is invoked on card click without second Run click
-        s5b.sendall(make_ws_frame(json.dumps({"v": 1, "type": "invoke", "id": "c2v:1", "node": "network.interfaces"}).encode()))
-        intermediate_prompts = []
-        res5b = None
-        for _ in range(10):
-            frame = read_ws_frame(s5b, timeout=2.0)
-            if not frame:
-                break
-            if frame.get("type") == "prompt":
-                intermediate_prompts.append(frame)
-            if frame.get("type") == "job" and frame.get("state") == "result":
-                res5b = frame
-                break
-
-        blocks5b = res5b.get("result", {}).get("blocks", []) if res5b else []
-        has_table5b = any(b.get("type") == "table" for b in blocks5b)
-        no_second_click_needed = len(intermediate_prompts) == 0 and has_table5b
-        s5b.close()
         check(
             "Test 5b: Rich click-to-view: Network > Interfaces renders table without a second click",
             no_second_click_needed,
-            f"table={has_table5b} prompts={len(intermediate_prompts)}",
+            f"table={has_table5b} prompts={prompts5b_count}",
         )
 
         # -------------------------------------------------------------------
