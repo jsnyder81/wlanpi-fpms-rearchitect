@@ -32,7 +32,7 @@ Remote clients, token scopes in core and a core event stream come after the firs
 | Actions | Async handlers returning `PageContent` text lines | View blocks; most become declarative core bindings |
 | Core access | HMAC with the shared secret | The secret directory is root-only (0700), so the `wlanpi` user cannot read it. Use a reserved `did=wlanpi-menud` JWT from a root helper |
 | Periodic work | Homepage refresh every 5 s, profiler check every 2 s | One loop in the service, publishing only on change |
-| Clients | OLED + GPIO, Textual TUI, Cockpit plugin polling every 1.5 s | Keep the TUI; WebUI plugin replaces Cockpit; panel evolves from wlanpi-fpms |
+| Clients | OLED + GPIO, Textual TUI, Cockpit plugin polling every 1.5 s | Keep the TUI; WebUI gains a new Menu panel; Cockpit stays as-is (removal out of scope — only the fpms2/menud prototype had a menu surface); panel evolves from wlanpi-fpms |
 | Panel hardware | `Type=simple`, `Requires=`, hardcoded `/dev/gpiochip0`, checks `"WLANPi Pro"` where FPMS uses `"WLAN Pi Pro"`, no splash or shutdown handling | Keep FPMS's code for all of this |
 | Auth | None on `/ws`, `/input`, `/navigate` | Auth on every connection |
 | Extras | Complications API | Keep; becomes the provider `publish` call |
@@ -355,7 +355,7 @@ Exit: the TUI runs every menu item whose core endpoint exists; two independent T
 Repos: `wlanpi-webui`, `wlanpi-menud`.
 
 - `proxy.sock`, nginx `/ui/ws` location with `auth_request`, Origin check, logout closes sessions.
-- Browser rendering of view blocks; Cockpit plugin retired.
+- Browser rendering of view blocks. Cockpit is **not** retired in this project (decision Nov 9: only the fpms2/menud prototype had a menu surface; the existing Cockpit plugin stays untouched).
 
 Exit: the TUI and two browser tabs run concurrently; WebUI logout ends that user's browser sessions.
 
