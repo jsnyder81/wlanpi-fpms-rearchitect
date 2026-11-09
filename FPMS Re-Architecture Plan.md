@@ -370,6 +370,17 @@ Post-rollout user feedback, batched in *FPMS Re-Architecture - UX TODO.md* (repo
 4. **WebUI three-way mode control** — Rich (private) | Thin (private, `mode=thin session=new`) | Thin (mirror panel). Previously thin existed only as the panel mirror.
 5. **Container e2e extended** — click-to-view, private-thin-session and `nav` assertions pin all of the above.
 
+#### Phase 2 UX polish round 2 (November 9, 2026)
+
+Further feedback, batched as items 5–10 in *FPMS Re-Architecture - UX TODO.md*:
+
+1. **Menu simplification** — `network.wlan_interfaces` merged into a single grouped **Network > Interfaces** screen (core's `/network/interfaces` already returns `{group: [records]}`; the second node was the same endpoint re-filtered). Parity rows updated.
+2. **Table styling** — zebra stripes removed (white-on-white rows), uniform dark rows with a slightly-lighter hover.
+3. **Results pane** — shows only the most recent result (previous folds to a one-line summary); no unbounded list.
+4. **Rich + mirror simultaneously** — a "Show panel mirror" side pane independent of the mode control, implemented as a **second connection** (thin attach to the default session) rather than a mode change; logout revoke covers both.
+5. **Rich root** — device-info strip (hostname, mode, IPs, temp) from the `device.summary` topic, mirroring the thin home screen.
+6. **TUI render coalescing** — the TUI repainted once per arriving frame, so keypress bursts lagged the browser; now a dirty-flag repaint at ~60 ms renders only the latest state, input still sends immediately.
+
 ### Phase 3: Panel opt-in
 
 Repos: `wlanpi-fpms`, `wlanpi-core` (parity endpoints).
