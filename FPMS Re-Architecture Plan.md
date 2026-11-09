@@ -381,6 +381,8 @@ Further feedback, batched as items 5–10 in *FPMS Re-Architecture - UX TODO.md*
 5. **Rich root** — device-info strip (hostname, mode, IPs, temp) from the `device.summary` topic, mirroring the thin home screen.
 6. **TUI render coalescing** — the TUI repainted once per arriving frame, so keypress bursts lagged the browser; now a dirty-flag repaint at ~60 ms renders only the latest state, input still sends immediately.
 
+Review round initially returned REQUEST-CHANGES (a real-browser blocker: `HTMLCollection.indexOf` misuse hidden by array-based test mocks; plus the leftover Adapters entry). Fixes landed with **HTMLCollection-faithful mocks** so the bug class is dead in tests; re-review **APPROVED** with mutation proofs. One item required an **additive v1 schema change** (optional `eth0`/`wlan0` on `device.summary`, since the payload was `additionalProperties: false`). Two non-blocking observations logged for later: no menud unit test for the poller's eth0/wlan0 fields; e2e 5f asserts Eth0 only.
+
 ### Phase 3: Panel opt-in
 
 Repos: `wlanpi-fpms`, `wlanpi-core` (parity endpoints).
