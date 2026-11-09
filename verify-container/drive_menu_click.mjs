@@ -33,20 +33,63 @@ const viewBlocksCode = fs.readFileSync(path.join(webuiDir, "wlanpi_webui/static/
 const menuCode = fs.readFileSync(path.join(webuiDir, "wlanpi_webui/static/js/menu.js"), "utf8");
 
 const elements = {};
+
+class MockHTMLCollection {
+  constructor(owner) {
+    this._owner = owner;
+    return new Proxy(this, {
+      get(target, prop) {
+        const arr = target._owner._children;
+        if (prop === "length") return arr.length;
+        if (prop === "item") return (idx) => arr[idx] ?? null;
+        if (prop === "namedItem") return (name) => arr.find((el) => el.id === name || (el.getAttribute && el.getAttribute("name") === name)) ?? null;
+        if (prop === Symbol.iterator) return arr[Symbol.iterator].bind(arr);
+        if (typeof prop === "string" && !isNaN(prop)) {
+          const idx = Number(prop);
+          return arr[idx];
+        }
+        // HTMLCollection has no Array prototype methods like indexOf, slice, etc.
+        return undefined;
+      },
+      has(target, prop) {
+        const arr = target._owner._children;
+        if (prop === "length" || prop === "item" || prop === "namedItem" || prop === Symbol.iterator) return true;
+        if (typeof prop === "string" && !isNaN(prop)) return Number(prop) < arr.length;
+        return false;
+      },
+    });
+  }
+}
+
 class MockElement {
   constructor(id) {
     this._id = id;
     if (id) elements[id] = this;
     this.dataset = {};
     this.style = {};
-    this.innerHTML = "";
+    this._innerHTML = "";
     this.textContent = "";
     this.className = "";
     this.listeners = {};
     this.value = "";
     this.checked = false;
-    this.children = [];
     this.parentElement = null;
+    this.parentNode = null;
+    this._children = [];
+    this.children = new MockHTMLCollection(this);
+  }
+  set innerHTML(val) {
+    this._innerHTML = val;
+    if (val === "") {
+      for (const c of this._children) {
+        c.parentElement = null;
+        c.parentNode = null;
+      }
+      this._children = [];
+    }
+  }
+  get innerHTML() {
+    return this._innerHTML ?? "";
   }
   set id(val) {
     this._id = val;
@@ -66,12 +109,12 @@ class MockElement {
   }
   querySelector(sel) {
     if (sel === ".rich-prev-body") {
-      for (const c of this.children) {
+      for (const c of this._children) {
         if (c.className && c.className.includes("rich-prev-body")) return c;
       }
       const b = new MockElement("rich-prev-body");
       b.className = "rich-prev-body";
-      this.children.push(b);
+      this.appendChild(b);
       return b;
     }
     return null;
@@ -80,26 +123,38 @@ class MockElement {
     return [];
   }
   get firstChild() {
-    return this.children[0] || null;
+    return this._children[0] || null;
   }
   appendChild(child) {
-    this.children.push(child);
+    if (child.parentElement) {
+      child.parentElement.removeChild(child);
+    }
+    this._children.push(child);
     child.parentElement = this;
+    child.parentNode = this;
     return child;
   }
   insertBefore(newChild, refChild) {
-    const idx = this.children.indexOf(refChild);
+    if (newChild.parentElement) {
+      newChild.parentElement.removeChild(newChild);
+    }
+    const idx = this._children.indexOf(refChild);
     if (idx !== -1) {
-      this.children.splice(idx, 0, newChild);
+      this._children.splice(idx, 0, newChild);
     } else {
-      this.children.unshift(newChild);
+      this._children.unshift(newChild);
     }
     newChild.parentElement = this;
+    newChild.parentNode = this;
     return newChild;
   }
   removeChild(child) {
-    this.children = this.children.filter((c) => c !== child);
+    const idx = this._children.indexOf(child);
+    if (idx !== -1) {
+      this._children.splice(idx, 1);
+    }
     child.parentElement = null;
+    child.parentNode = null;
     return child;
   }
   scrollIntoView() {}
@@ -323,13 +378,17 @@ const boundsOk =
   prevDetails !== null &&
   prevDetails !== undefined;
 
+const deviceStripHtml = elements["rich-device-summary"] ? elements["rich-device-summary"].innerHTML : "";
+const hasEth0InStrip = deviceStripHtml.includes("Eth0 IP") && deviceStripHtml.includes("192.0.2.10");
+const stripOk = Boolean(hasEth0InStrip);
+
 if (liveSocket) {
   try {
     liveSocket.close(1000, "test done");
   } catch (e) {}
 }
 
-const allOk = noSecondClick && groupedTableOk && boundsOk;
+const allOk = noSecondClick && groupedTableOk && boundsOk && stripOk;
 
 const summary = {
   ok: allOk,
@@ -338,6 +397,7 @@ const summary = {
   detailDisplay: detailDisplay,
   groupedTable: groupedTableOk,
   boundsOk: boundsOk,
+  stripOk: stripOk,
   childrenCount: resultsContainer ? resultsContainer.children.length : -1,
 };
 

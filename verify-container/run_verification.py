@@ -652,6 +652,7 @@ async def main():
         )
         grouped_table_5b = bool(res_json.get("groupedTable")) if res_json else False
         bounds_ok_5b = bool(res_json.get("boundsOk")) if res_json else False
+        strip_ok_5b = bool(res_json.get("stripOk")) if res_json else False
         check(
             "Test 5d: Grouped interfaces table: Ethernet, WLAN, and Adapter sub-rows present",
             grouped_table_5b,
@@ -661,6 +662,11 @@ async def main():
             "Test 5e: Results pane bounds: successive actions keep results DOM bounded (<=2)",
             bounds_ok_5b,
             f"bounds_ok={bounds_ok_5b} children={res_json.get('childrenCount') if res_json else -1}",
+        )
+        check(
+            "Test 5f: Device strip: Eth0 IP present in device strip",
+            strip_ok_5b,
+            f"strip_ok={strip_ok_5b}",
         )
 
         # -------------------------------------------------------------------
@@ -823,9 +829,16 @@ async def main():
         res_dual_rich = drain_until(sock_a1, lambda f: f.get("type") == "job" and f.get("state") == "result")
         v_dual_side = drain_until(sock_side, lambda f: f.get("type") == "view")
 
-        # Close side-mirror only: sock_a1 must remain open and functional
-        sock_side.close()
+        # Assert driven-by indicator on side-mirror socket
+        driven_by = v_dual_side.get("driven_by") if v_dual_side else None
+        driven_ok = (
+            driven_by is not None
+            and driven_by.get("self") is True
+            and driven_by.get("surface") == "wlanpi-webui-side-mirror"
+            and driven_by.get("principal", {}).get("name") == "alice"
+        )
 
+        # Independent sockets: sock_a1 must remain open and functional while sock_side is open
         sock_a1.sendall(make_ws_frame(json.dumps({"v": 1, "type": "invoke", "id": "inv:dual_after", "node": "network.eth0_ipconfig"}).encode()))
         res_dual_after = drain_until(sock_a1, lambda f: f.get("type") == "job" and f.get("state") == "result")
 
@@ -833,12 +846,13 @@ async def main():
             w_side.get("session_id") == default_id
             and res_dual_rich is not None
             and v_dual_side is not None
+            and driven_ok
             and res_dual_after is not None
         )
         check(
-            "Test 6f: Rich + Mirror dual connection: concurrent frames and independent detach",
+            "Test 6f: Rich + Mirror dual connection: concurrent frames, driven-by indicator, and independent sockets",
             dual_conn_ok,
-            f"dual_ok={dual_conn_ok}",
+            f"dual_ok={dual_conn_ok} driven_ok={driven_ok}",
         )
 
         # -------------------------------------------------------------------
@@ -848,9 +862,10 @@ async def main():
         logout_st = http_logout(ck_hdr_a, csrf_a)
         check("Test 7a: POST /logout via nginx returns 302", logout_st in (302, 303, 200), f"status={logout_st}")
 
-        # Alice's Tab 1 and Tab 2 must receive close frame 4401
+        # Alice's Tab 1, Tab 2, and side-mirror must all receive close frame 4401
         c_a1 = drain_until(sock_a1, lambda f: f.get("type") == "close")
         c_a2 = drain_until(sock_a2, lambda f: f.get("type") == "close")
+        c_side = drain_until(sock_side, lambda f: f.get("type") == "close")
         check(
             "Test 7b: Tab 1 (alice rich) closed 4401",
             c_a1 is not None and c_a1.get("code") == 4401,
@@ -861,6 +876,15 @@ async def main():
             c_a2 is not None and c_a2.get("code") == 4401,
             f"frame={c_a2}",
         )
+        check(
+            "Test 7c2: Side mirror (alice thin default) closed 4401 on logout",
+            c_side is not None and c_side.get("code") == 4401,
+            f"frame={c_side}",
+        )
+        try:
+            sock_side.close()
+        except Exception:
+            pass
 
         # Tab 3 (bob) must stay open and usable
         no_close_bob = read_ws_frame(sock_b1, 0.4) is None
