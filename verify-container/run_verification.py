@@ -633,6 +633,7 @@ async def main():
         has_table5b = False
         prompts5b_count = -1
         no_second_click_needed = False
+        res_json = None
         if res5b_proc.returncode == 0:
             try:
                 res_json = json.loads(res5b_proc.stdout.strip().splitlines()[-1])
@@ -648,6 +649,18 @@ async def main():
             "Test 5b: Rich click-to-view: Network > Interfaces renders table without a second click",
             no_second_click_needed,
             f"table={has_table5b} prompts={prompts5b_count}",
+        )
+        grouped_table_5b = bool(res_json.get("groupedTable")) if res_json else False
+        bounds_ok_5b = bool(res_json.get("boundsOk")) if res_json else False
+        check(
+            "Test 5d: Grouped interfaces table: Ethernet, WLAN, and Adapter sub-rows present",
+            grouped_table_5b,
+            f"grouped_table={grouped_table_5b}",
+        )
+        check(
+            "Test 5e: Results pane bounds: successive actions keep results DOM bounded (<=2)",
+            bounds_ok_5b,
+            f"bounds_ok={bounds_ok_5b} children={res_json.get('childrenCount') if res_json else -1}",
         )
 
         # -------------------------------------------------------------------
@@ -787,6 +800,45 @@ async def main():
             "Test 6e: Private thin session (mode=thin, session=new) navigates with own cursor",
             is_private_session and v_priv_menu is not None,
             f"session_new={is_private_session} menu_view={v_priv_menu is not None}",
+        )
+
+        # -------------------------------------------------------------------
+        # Test 6f: Rich + Mirror dual connection assertion (Item 8)
+        # Simultaneous rich private session + thin mirror connection on same user
+        # -------------------------------------------------------------------
+        log.info("Running Test 6f: Rich + Mirror dual connection on single user session...")
+        st_side, sock_side, w_side = browser_connect(
+            ck_hdr_a,
+            {
+                "v": 1, "type": "hello", "id": "h:side_mirror", "mode": "thin", "session": "default", "protocol": [1],
+                "client": {"name": "wlanpi-webui-side-mirror"},
+            },
+        )
+        drain_until(sock_side, lambda f: f.get("type") == "view")
+
+        # Simultaneously invoke on sock_a1 (rich private) and input on sock_side (thin mirror)
+        sock_a1.sendall(make_ws_frame(json.dumps({"v": 1, "type": "invoke", "id": "inv:dual_a", "node": "network.lldp"}).encode()))
+        sock_side.sendall(make_ws_frame(json.dumps({"v": 1, "type": "input", "id": "in:dual_side", "key": "up"}).encode()))
+
+        res_dual_rich = drain_until(sock_a1, lambda f: f.get("type") == "job" and f.get("state") == "result")
+        v_dual_side = drain_until(sock_side, lambda f: f.get("type") == "view")
+
+        # Close side-mirror only: sock_a1 must remain open and functional
+        sock_side.close()
+
+        sock_a1.sendall(make_ws_frame(json.dumps({"v": 1, "type": "invoke", "id": "inv:dual_after", "node": "network.eth0_ipconfig"}).encode()))
+        res_dual_after = drain_until(sock_a1, lambda f: f.get("type") == "job" and f.get("state") == "result")
+
+        dual_conn_ok = (
+            w_side.get("session_id") == default_id
+            and res_dual_rich is not None
+            and v_dual_side is not None
+            and res_dual_after is not None
+        )
+        check(
+            "Test 6f: Rich + Mirror dual connection: concurrent frames and independent detach",
+            dual_conn_ok,
+            f"dual_ok={dual_conn_ok}",
         )
 
         # -------------------------------------------------------------------

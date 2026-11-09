@@ -44,7 +44,9 @@ class MockElement {
     this.className = "";
     this.listeners = {};
     this.value = "";
+    this.checked = false;
     this.children = [];
+    this.parentElement = null;
   }
   set id(val) {
     this._id = val;
@@ -62,7 +64,16 @@ class MockElement {
       this.listeners[evt] = this.listeners[evt].filter((f) => f !== fn);
     }
   }
-  querySelector() {
+  querySelector(sel) {
+    if (sel === ".rich-prev-body") {
+      for (const c of this.children) {
+        if (c.className && c.className.includes("rich-prev-body")) return c;
+      }
+      const b = new MockElement("rich-prev-body");
+      b.className = "rich-prev-body";
+      this.children.push(b);
+      return b;
+    }
     return null;
   }
   querySelectorAll() {
@@ -73,6 +84,7 @@ class MockElement {
   }
   appendChild(child) {
     this.children.push(child);
+    child.parentElement = this;
     return child;
   }
   insertBefore(newChild, refChild) {
@@ -82,16 +94,20 @@ class MockElement {
     } else {
       this.children.unshift(newChild);
     }
+    newChild.parentElement = this;
     return newChild;
   }
   removeChild(child) {
     this.children = this.children.filter((c) => c !== child);
+    child.parentElement = null;
     return child;
   }
   scrollIntoView() {}
   dispatchEvent(event) {
     const fns = this.listeners[event.type] || [];
     for (const fn of fns) fn(event);
+    const onHandler = this["on" + event.type];
+    if (typeof onHandler === "function") onHandler(event);
   }
   closest(sel) {
     if (sel === ".menu-node-card") return this;
@@ -101,16 +117,30 @@ class MockElement {
   getAttribute(name) {
     return this[name] || this.dataset[name] || null;
   }
+  setAttribute(name, val) {
+    this[name] = val;
+    this.dataset[name] = val;
+  }
 }
 
 // Instantiate standard menu DOM elements
 elements["menu-panel"] = new MockElement("menu-panel");
 elements["menu-mode-select"] = new MockElement("menu-mode-select");
 elements["toggle-mirror-mode"] = new MockElement("toggle-mirror-mode");
+elements["toggle-side-mirror"] = new MockElement("toggle-side-mirror");
+elements["close-side-mirror"] = new MockElement("close-side-mirror");
+elements["side-mirror-container"] = new MockElement("side-mirror-container");
+elements["side-mirror-status"] = new MockElement("side-mirror-status");
+elements["side-mirror-title"] = new MockElement("side-mirror-title");
+elements["side-mirror-breadcrumb"] = new MockElement("side-mirror-breadcrumb");
+elements["side-mirror-driven-by"] = new MockElement("side-mirror-driven-by");
+elements["side-mirror-screen-blocks"] = new MockElement("side-mirror-screen-blocks");
+elements["side-mirror-hints"] = new MockElement("side-mirror-hints");
 elements["rich-mode-container"] = new MockElement("rich-mode-container");
 elements["mirror-mode-container"] = new MockElement("mirror-mode-container");
 elements["menu-connection-status"] = new MockElement("menu-connection-status");
 elements["menu-session-kind"] = new MockElement("menu-session-kind");
+elements["rich-device-summary"] = new MockElement("rich-device-summary");
 elements["rich-menu-items"] = new MockElement("rich-menu-items");
 elements["rich-action-detail"] = new MockElement("rich-action-detail");
 elements["rich-job-results"] = new MockElement("rich-job-results");
@@ -123,10 +153,21 @@ let menuFramePromiseResolve;
 const menuFrameReceived = new Promise((res) => {
   menuFramePromiseResolve = res;
 });
-let jobResultPromiseResolve;
-const jobResultReceived = new Promise((res) => {
-  jobResultPromiseResolve = res;
-});
+const jobResultQueue = [];
+let nextJobResolve = null;
+
+function waitForJobResult(timeoutMs = 5000) {
+  if (jobResultQueue.length > 0) {
+    return Promise.resolve(jobResultQueue.shift());
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Timeout waiting for job result")), timeoutMs);
+    nextJobResolve = (frame) => {
+      clearTimeout(timer);
+      resolve(frame);
+    };
+  });
+}
 
 class LiveWebSocket extends globalThis.WebSocket {
   constructor(url) {
@@ -145,14 +186,21 @@ class LiveWebSocket extends globalThis.WebSocket {
       try {
         const frame = JSON.parse(evt.data);
         framesReceived.push(frame);
-        if (frame.type === "menu") {
+        if (frame.type === "menu" && menuFramePromiseResolve) {
           menuFramePromiseResolve(frame);
+          menuFramePromiseResolve = null;
         }
         if (frame.type === "prompt") {
           intermediatePrompts.push(frame);
         }
         if (frame.type === "job" && frame.state === "result") {
-          jobResultPromiseResolve(frame);
+          if (nextJobResolve) {
+            const r = nextJobResolve;
+            nextJobResolve = null;
+            r(frame);
+          } else {
+            jobResultQueue.push(frame);
+          }
         }
       } catch (e) {}
     });
@@ -177,6 +225,7 @@ const ctx = {
   },
   document: {
     getElementById: (id) => elements[id] || null,
+    createElement: (tag) => new MockElement(tag),
     addEventListener: (evt, fn) => {
       documentListeners[evt] = fn;
     },
@@ -217,7 +266,7 @@ const menuFrame = await Promise.race([
   new Promise((_, rej) => setTimeout(() => rej(new Error("Timeout waiting for menu frame")), 5000)),
 ]);
 
-// 4. Drive card click via REAL browser event path
+// 4. Drive first card click (network.interfaces) via REAL browser event path
 const card = new MockElement("card");
 card["data-node-id"] = "network.interfaces";
 card["data-is-branch"] = "0";
@@ -228,20 +277,51 @@ elements["menu-panel"].dispatchEvent({
   preventDefault: () => {},
 });
 
-// 5. Wait for job result from menud
-const resultFrame = await Promise.race([
-  jobResultReceived,
-  new Promise((_, rej) => setTimeout(() => rej(new Error("Timeout waiting for job result (auto-invoke failed)")), 5000)),
-]);
+// 5. Wait for first job result from menud
+const resultFrame = await waitForJobResult(5000);
 
-// 6. Verify result
+// 6. Verify first result (interfaces grouped table)
 const blocks = (resultFrame && resultFrame.result && resultFrame.result.blocks) || [];
-const hasTable = blocks.some((b) => b.type === "table");
+const ifaceTable = blocks.find((b) => b.type === "table");
+const hasTable = Boolean(ifaceTable);
+const rows = (ifaceTable && ifaceTable.rows) || [];
+const hasEthRow = rows.some((r) => Array.isArray(r) && r[0] === "Ethernet");
+const hasWlanRow = rows.some((r) => Array.isArray(r) && r[0] === "WLAN");
+const hasAdapterSubRow = rows.some(
+  (r) =>
+    Array.isArray(r) &&
+    r[0] === "" &&
+    (String(r[1]).includes("MAC:") ||
+      String(r[1]).includes("Model:") ||
+      String(r[1]).includes("Type:") ||
+      String(r[1]).includes("Driver:"))
+);
+const groupedTableOk = Boolean(hasEthRow && hasWlanRow && hasAdapterSubRow);
+
 const promptsCount = intermediatePrompts.length;
 const detailDisplay = elements["rich-action-detail"].style.display;
-
-// Detail pane must remain hidden (single click direct invoke)
 const noSecondClick = (detailDisplay === "none" || !detailDisplay) && promptsCount === 0 && hasTable;
+
+// 7. Drive second card click (network.lldp) to test bounded results pane
+const card2 = new MockElement("card2");
+card2["data-node-id"] = "network.lldp";
+card2["data-is-branch"] = "0";
+
+elements["menu-panel"].dispatchEvent({
+  type: "click",
+  target: card2,
+  preventDefault: () => {},
+});
+
+const resultFrame2 = await waitForJobResult(5000);
+
+const resultsContainer = elements["rich-job-results"];
+const prevDetails = elements["rich-previous-result"];
+const boundsOk =
+  resultsContainer &&
+  resultsContainer.children.length <= 2 &&
+  prevDetails !== null &&
+  prevDetails !== undefined;
 
 if (liveSocket) {
   try {
@@ -249,12 +329,17 @@ if (liveSocket) {
   } catch (e) {}
 }
 
+const allOk = noSecondClick && groupedTableOk && boundsOk;
+
 const summary = {
-  ok: noSecondClick,
+  ok: allOk,
   table: hasTable,
   prompts: promptsCount,
   detailDisplay: detailDisplay,
+  groupedTable: groupedTableOk,
+  boundsOk: boundsOk,
+  childrenCount: resultsContainer ? resultsContainer.children.length : -1,
 };
 
 console.log(JSON.stringify(summary));
-process.exit(noSecondClick ? 0 : 1);
+process.exit(allOk ? 0 : 1);
