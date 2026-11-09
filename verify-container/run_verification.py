@@ -617,6 +617,83 @@ async def main():
         )
 
         # -------------------------------------------------------------------
+        # Test 5b: Rich click-to-view assertion (single action click renders table without a second click)
+        # -------------------------------------------------------------------
+        log.info("Running Test 5b: Rich click-to-view renders table without second click...")
+        st5b, s5b, w5b = browser_connect(
+            ck_hdr_a,
+            {
+                "v": 1, "type": "hello", "id": "h:rich_c2v", "mode": "rich", "session": "new", "protocol": [1],
+                "capabilities": {"blocks": ["text", "kv", "table", "list", "qr", "status", "progress", "confirm"]},
+            },
+        )
+        drain_until(s5b, lambda f: f.get("type") == "menu")
+
+        # In rich mode, Network > Interfaces is invoked on card click without second Run click
+        s5b.sendall(make_ws_frame(json.dumps({"v": 1, "type": "invoke", "id": "c2v:1", "node": "network.interfaces"}).encode()))
+        intermediate_prompts = []
+        res5b = None
+        for _ in range(10):
+            frame = read_ws_frame(s5b, timeout=2.0)
+            if not frame:
+                break
+            if frame.get("type") == "prompt":
+                intermediate_prompts.append(frame)
+            if frame.get("type") == "job" and frame.get("state") == "result":
+                res5b = frame
+                break
+
+        blocks5b = res5b.get("result", {}).get("blocks", []) if res5b else []
+        has_table5b = any(b.get("type") == "table" for b in blocks5b)
+        no_second_click_needed = len(intermediate_prompts) == 0 and has_table5b
+        s5b.close()
+        check(
+            "Test 5b: Rich click-to-view: Network > Interfaces renders table without a second click",
+            no_second_click_needed,
+            f"table={has_table5b} prompts={len(intermediate_prompts)}",
+        )
+
+        # -------------------------------------------------------------------
+        # Test 5c: Nav frame assertion (branch, view-action, and invalid node)
+        # -------------------------------------------------------------------
+        log.info("Running Test 5c: Nav frame navigates to branch and view-action and reports errors...")
+        st5c, s5c, w5c = browser_connect(
+            ck_hdr_a,
+            {
+                "v": 1, "type": "hello", "id": "h:nav", "mode": "rich", "session": "new", "protocol": [1],
+                "capabilities": {"blocks": ["text", "kv", "table", "list", "qr", "status", "progress", "confirm"]},
+            },
+        )
+        drain_until(s5c, lambda f: f.get("type") == "menu")
+
+        # 1. Nav to branch
+        s5c.sendall(make_ws_frame(json.dumps({"v": 1, "type": "nav", "id": "nav:branch", "node": "network"}).encode()))
+        v_branch = drain_until(s5c, lambda f: f.get("id") == "nav:branch" and f.get("type") == "view")
+        ok_branch = (
+            v_branch is not None
+            and v_branch.get("screen") == "menu"
+            and v_branch.get("breadcrumb") == ["Network"]
+            and v_branch.get("title") == "Network"
+        )
+
+        # 2. Nav to view-action
+        s5c.sendall(make_ws_frame(json.dumps({"v": 1, "type": "nav", "id": "nav:leaf", "node": "network.interfaces"}).encode()))
+        v_leaf = drain_until(s5c, lambda f: f.get("type") == "view" and f.get("screen") == "result" and f.get("node") == "network.interfaces")
+        ok_leaf = v_leaf is not None and any(b.get("type") == "table" for b in v_leaf.get("blocks", []))
+
+        # 3. Nav to unknown node
+        s5c.sendall(make_ws_frame(json.dumps({"v": 1, "type": "nav", "id": "nav:err", "node": "invalid.nonexistent"}).encode()))
+        err_nav = drain_until(s5c, lambda f: f.get("id") == "nav:err" and f.get("type") == "error")
+        ok_err = err_nav is not None and err_nav.get("code") == "NOT_FOUND"
+
+        s5c.close()
+        check(
+            "Test 5c: Nav frame navigates to branch and view-action and reports errors",
+            ok_branch and ok_leaf and ok_err,
+            f"branch={ok_branch} leaf={ok_leaf} err={ok_err}",
+        )
+
+        # -------------------------------------------------------------------
         # Test 6: Concurrency: TUI + 2 alice browser tabs (rich + mirror) + 1 bob tab
         # -------------------------------------------------------------------
         log.info("Running Test 6: TUI and 3 browser tabs running concurrently...")
@@ -689,6 +766,30 @@ async def main():
         check(
             "Test 6d: Concurrent rich action invocations for multiple users",
             res_a1 is not None and res_b1 is not None,
+        )
+
+        # -------------------------------------------------------------------
+        # Test 6e: Private thin session assertion (mode=thin, session=new)
+        # -------------------------------------------------------------------
+        log.info("Running Test 6e: Private thin session navigates independently...")
+        st_thin_priv, sock_thin_priv, w_thin_priv = browser_connect(
+            ck_hdr_a,
+            {"v": 1, "type": "hello", "id": "h:thin_priv", "mode": "thin", "session": "new", "protocol": [1]},
+        )
+        v_priv_home = drain_until(sock_thin_priv, lambda f: f.get("type") == "view")
+        is_private_session = (
+            w_thin_priv.get("session") == "new"
+            and w_thin_priv.get("session_id") != default_id
+            and v_priv_home is not None
+        )
+        # Drive input on the private thin session
+        sock_thin_priv.sendall(make_ws_frame(json.dumps({"v": 1, "type": "input", "id": "in:priv", "key": "down"}).encode()))
+        v_priv_menu = drain_until(sock_thin_priv, lambda f: f.get("type") == "view" and f.get("screen") == "menu")
+        sock_thin_priv.close()
+        check(
+            "Test 6e: Private thin session (mode=thin, session=new) navigates with own cursor",
+            is_private_session and v_priv_menu is not None,
+            f"session_new={is_private_session} menu_view={v_priv_menu is not None}",
         )
 
         # -------------------------------------------------------------------
