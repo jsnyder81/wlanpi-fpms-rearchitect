@@ -7,4 +7,5 @@ RUN apt-get update && \
         openssl \
         ca-certificates \
         curl \
+        procps \
     && rm -rf /var/lib/apt/lists/*
