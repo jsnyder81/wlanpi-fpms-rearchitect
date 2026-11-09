@@ -8,4 +8,5 @@ RUN apt-get update && \
         ca-certificates \
         curl \
         procps \
+        sudo \
     && rm -rf /var/lib/apt/lists/*

@@ -133,7 +133,10 @@ def make_ws_frame(payload: bytes) -> bytes:
 
 def read_ws_frame(sock: socket.socket, timeout: float = 4.0) -> dict | None:
     sock.settimeout(timeout)
-    head = sock.recv(2)
+    try:
+        head = sock.recv(2)
+    except (socket.timeout, TimeoutError):
+        return None
     if len(head) < 2:
         return None
     b1, b2 = head[0], head[1]
@@ -250,6 +253,134 @@ def raw_ws_connect_unix(
     return status_code, resp_headers, sock
 
 
+def run_real_uid_operator_client(
+    sock_path: str | Path,
+    uid: int,
+    user_name: str | None,
+    session_id_to_revoke: str,
+) -> tuple[dict | None, dict | None]:
+    """Connect to local.sock as a real separate process with operator UID.
+
+    Uses sudo -u or setuid so SO_PEERCRED carried by the Linux kernel genuinely
+    reflects the operator UID. Returns (welcome_frame, error_frame).
+    """
+    helper_code = f"""
+import json, socket, struct, sys
+
+def make_ws_frame(payload: bytes) -> bytes:
+    mask = b"\\xaa\\xbb\\xcc\\xdd"
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    length = len(payload)
+    if length < 126:
+        header = bytes([0x81, 0x80 | length]) + mask
+    elif length < 65536:
+        header = struct.pack("!BBH", 0x81, 0x80 | 126, length) + mask
+    else:
+        header = struct.pack("!BBQ", 0x81, 0x80 | 127, length) + mask
+    return header + masked
+
+def read_ws_frame(sock, timeout=4.0):
+    sock.settimeout(timeout)
+    try:
+        head = sock.recv(2)
+    except (socket.timeout, TimeoutError):
+        return None
+    if len(head) < 2:
+        return None
+    b1, b2 = head[0], head[1]
+    opcode = b1 & 0x0F
+    is_masked = bool(b2 & 0x80)
+    payload_len = b2 & 0x7F
+    if payload_len == 126:
+        payload_len = int.from_bytes(sock.recv(2), "big")
+    elif payload_len == 127:
+        payload_len = int.from_bytes(sock.recv(8), "big")
+    mask = sock.recv(4) if is_masked else b""
+    data = b""
+    while len(data) < payload_len:
+        chunk = sock.recv(payload_len - len(data))
+        if not chunk:
+            break
+        data += chunk
+    if is_masked:
+        data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+    if opcode == 0x08:
+        code = struct.unpack("!H", data[:2])[0] if len(data) >= 2 else None
+        reason = data[2:].decode("utf-8", "ignore")
+        return {{"type": "close", "code": code, "reason": reason}}
+    if opcode == 0x01:
+        return json.loads(data.decode("utf-8"))
+    return None
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(4.0)
+sock.connect({repr(str(sock_path))})
+
+# HTTP WebSocket handshake
+req = (
+    "GET /ui/ws HTTP/1.1\\r\\n"
+    "Host: localhost\\r\\n"
+    "Upgrade: websocket\\r\\n"
+    "Connection: Upgrade\\r\\n"
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\\r\\n"
+    "Sec-WebSocket-Version: 13\\r\\n\\r\\n"
+).encode()
+sock.sendall(req)
+resp = b""
+while b"\\r\\n\\r\\n" not in resp:
+    chunk = sock.recv(1024)
+    if not chunk:
+        break
+    resp += chunk
+
+# Send hello as operator
+sock.sendall(make_ws_frame(json.dumps({{"v": 1, "type": "hello", "id": "h:op", "mode": "rich", "protocol": [1]}}).encode()))
+welcome = read_ws_frame(sock)
+
+# Send revoke
+sock.sendall(make_ws_frame(json.dumps({{"v": 1, "type": "revoke", "id": "r:op", "webui_session": {repr(session_id_to_revoke)}}}).encode()))
+
+err = None
+while True:
+    f = read_ws_frame(sock, timeout=2.0)
+    if not f:
+        break
+    if f.get("type") == "error":
+        err = f
+        break
+
+sock.close()
+print(json.dumps({{"welcome": welcome, "error": err}}))
+"""
+    sudo_bin = shutil.which("sudo")
+    if sudo_bin and user_name:
+        cmd = [sudo_bin, "-u", user_name, sys.executable, "-c", helper_code]
+        preexec = None
+    elif sudo_bin:
+        cmd = [sudo_bin, "-u", f"#{uid}", sys.executable, "-c", helper_code]
+        preexec = None
+    else:
+        cmd = [sys.executable, "-c", helper_code]
+        def set_creds():
+            try:
+                os.setgroups([])
+            except Exception:
+                pass
+            os.setgid(uid)
+            os.setuid(uid)
+        preexec = set_creds
+
+    proc = subprocess.run(
+        cmd,
+        preexec_fn=preexec,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    data = json.loads(proc.stdout)
+    return data.get("welcome"), data.get("error")
+
+
 async def main():
     log.info("Starting container verification...")
 
@@ -310,6 +441,11 @@ upstream grafana { server 127.0.0.1:3000; }
     fake_webui.start()
 
     # 5. Start real wlanpi-menud on /run/wlanpi-menud/proxy/proxy.sock with fakecore and real menu
+    OPERATOR_UID = 1001
+    OPERATOR_USER = "operator"
+    # Ensure operator user exists with uid 1001 in 'operator' group
+    subprocess.run(["useradd", "-u", str(OPERATOR_UID), "-g", "operator", OPERATOR_USER], capture_output=True)
+
     fake_core = FakeCore()
     tokens = TokenSource(("get-core-token",), runner=fake_core.token_runner())
     core_client = CoreClient(BASE, tokens, transport=fake_core.transport())
@@ -321,7 +457,7 @@ upstream grafana { server 127.0.0.1:3000; }
         proxy_sock=menud_proxy_sock,
         local_sock=menud_local_sock,
         proxy_sock_group="www-data",
-        local_uids={os.getuid(): ("admin",)},
+        local_uids={os.getuid(): ("admin",), OPERATOR_UID: ("operator",)},
         allowed_origins=(),  # Origin host must match Host header
         validate_outbound=True,
     )
@@ -581,9 +717,9 @@ upstream grafana { server 127.0.0.1:3000; }
         log.info("--> Test 6 PASSED!")
 
         # -------------------------------------------------------------------
-        # Test 7: Logout closes the browser session
+        # Test 7: Real-UID operator on local.sock receives FORBIDDEN on revoke
         # -------------------------------------------------------------------
-        log.info("Running Test 7: Logout closes the browser session...")
+        log.info("Running Test 7: Real-UID operator on local.sock receives FORBIDDEN on revoke...")
         status, _, sock_browser = await asyncio.to_thread(
             raw_ws_connect,
             "127.0.0.1", 443, "/ui/ws",
@@ -601,8 +737,42 @@ upstream grafana { server 127.0.0.1:3000; }
         await asyncio.to_thread(sock_browser.sendall, make_ws_frame(hello_b))
         w = await asyncio.to_thread(read_ws_frame, sock_browser)
         assert w and w.get("type") == "welcome"
+        m = await asyncio.to_thread(read_ws_frame, sock_browser)
+        assert m and m.get("type") == "menu"
 
-        # WebUI logout calls revoke_menu_session for alice's session ("sess-alice-456")
+        # Operator client runs with genuine UID 1001 via sudo -u / setuid
+        w_op, err_op = await asyncio.to_thread(
+            run_real_uid_operator_client,
+            menud_local_sock,
+            OPERATOR_UID,
+            OPERATOR_USER,
+            "sess-alice-456",
+        )
+        assert w_op and w_op.get("type") == "welcome", f"Unexpected operator welcome: {w_op}"
+        assert "operator" in w_op.get("roles", []), f"Operator role missing in {w_op}"
+        assert "admin" not in w_op.get("roles", []), f"Operator must not have admin role: {w_op}"
+        assert w_op.get("principal", {}).get("uid") == OPERATOR_UID, f"Real UID mismatch: {w_op}"
+
+        assert err_op and err_op.get("type") == "error", f"Expected error frame, got: {err_op}"
+        assert err_op.get("code") == "FORBIDDEN", f"Expected FORBIDDEN, got: {err_op.get('code')}"
+        assert "local admin principals" in err_op.get("message", "").lower()
+        log.info(
+            "Authoritative check passed: Real-UID operator (uid=%d) received FORBIDDEN: %s",
+            OPERATOR_UID,
+            err_op.get("message"),
+        )
+
+        # Crucial check: Alice's browser session was NOT closed by operator's forbidden revoke attempt
+        no_frame = await asyncio.to_thread(read_ws_frame, sock_browser, 0.4)
+        assert no_frame is None, f"Expected session to remain open, but received: {no_frame}"
+        results.append(("Test 7: Real-UID operator on local.sock receives FORBIDDEN on revoke", True))
+        log.info("--> Test 7 PASSED!")
+
+        # -------------------------------------------------------------------
+        # Test 8: Logout / admin session revocation closes the browser session
+        # -------------------------------------------------------------------
+        log.info("Running Test 8: Admin revoke closes the browser session with 4401...")
+        # Local admin (root) calls revoke_menu_session for alice's session ("sess-alice-456")
         revoked = await asyncio.to_thread(
             revoke_menu_session,
             "sess-alice-456",
@@ -622,8 +792,8 @@ upstream grafana { server 127.0.0.1:3000; }
         assert close_frame and close_frame.get("type") == "close", f"Expected close frame, got {close_frame}"
         assert close_frame.get("code") == 4401, f"Expected close code 4401, got {close_frame.get('code')}"
         sock_browser.close()
-        results.append(("Test 7: WebUI logout / session revocation closes browser session with 4401", True))
-        log.info("--> Test 7 PASSED!")
+        results.append(("Test 8: WebUI logout / session revocation closes browser session with 4401", True))
+        log.info("--> Test 8 PASSED!")
 
     finally:
         log.info("Cleaning up services...")
