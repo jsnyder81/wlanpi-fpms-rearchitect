@@ -383,6 +383,16 @@ Further feedback, batched as items 5–10 in *FPMS Re-Architecture - UX TODO.md*
 
 Review round initially returned REQUEST-CHANGES (a real-browser blocker: `HTMLCollection.indexOf` misuse hidden by array-based test mocks; plus the leftover Adapters entry). Fixes landed with **HTMLCollection-faithful mocks** so the bug class is dead in tests; re-review **APPROVED** with mutation proofs. One item required an **additive v1 schema change** (optional `eth0`/`wlan0` on `device.summary`, since the payload was `additionalProperties: false`). Two non-blocking observations logged for later: no menud unit test for the poller's eth0/wlan0 fields; e2e 5f asserts Eth0 only.
 
+#### WebUI panel redesign (November 10, 2026)
+
+User released the panel from backward compatibility ("no need to maintain the existing menu plugin"); Claude reviewed, designed (`wlanpi-menud/docs/webui-menu-redesign.md`) and implemented on `wlanpi-webui` branch `redesign/webui-menu-panel`; Antigravity verified — APPROVE, zero findings.
+
+- **One surface**: `/menu` is always the rich private session; the panel mirror is an optional front-panel pane (second thin connection); thin-private survives only as a `?panel=private` dev flag. The mode control is gone.
+- **Every node is a URL-hash page**; results render on the action's own page — no Results column.
+- **Navigation cannot change the device**: read-only no-param views run on arrival; mutating/paramful/confirm actions require an explicit Run (user accepted two-click over panel one-click). Verified by network-level e2e capture.
+- Always-visible device status bar + Home device card; connection loss keeps content under a banner with backoff countdown and `hello.resume`.
+- Protocol and schemas **unchanged** (presentation-only); Playwright/headless-Chromium replaced mock-based browser e2e (147 assertions; verify image ~1.6 GB).
+
 ### Phase 3: Panel opt-in
 
 Repos: `wlanpi-fpms`, `wlanpi-core` (parity endpoints).
