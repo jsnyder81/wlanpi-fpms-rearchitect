@@ -392,6 +392,7 @@ User released the panel from backward compatibility ("no need to maintain the ex
 - **Navigation cannot change the device**: read-only no-param views run on arrival; mutating/paramful/confirm actions require an explicit Run (user accepted two-click over panel one-click). Verified by network-level e2e capture.
 - Always-visible device status bar + Home device card; connection loss keeps content under a banner with backoff countdown and `hello.resume`.
 - Protocol and schemas **unchanged** (presentation-only); Playwright/headless-Chromium replaced mock-based browser e2e (147 assertions; verify image ~1.6 GB).
+- Deployed to the M4+ test device Nov 10: 9/9 live checks through real nginx, including two-click mutation safety, mirror-pane tracking, and disconnect/resume. Rollback deb preserved on device; evidence in `/tmp/opencode/device-deploy-redesign.md`.
 
 ### Phase 3: Panel opt-in
 
