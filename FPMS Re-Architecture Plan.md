@@ -109,7 +109,7 @@ Actions that need logic (multi-step flows, the composed adapter summary from cor
 
 | Mode | Used by | Server holds | Client sends |
 | --- | --- | --- | --- |
-| Thin | Panel, TUI, WebUI (private or panel-mirror) | The nav cursor; renders the current view | `input` (up, down, left, right, center, key1 to key3) |
+| Thin | Panel, TUI, WebUI front-panel mirror pane (thin-private survives only as a `?panel=private` dev flag since the Nov 10 redesign) | The nav cursor; renders the current view | `input` (up, down, left, right, center, key1 to key3) |
 | Rich | WebUI, mobile app | Nothing per screen | `invoke` on a node id; navigates the tree locally, `nav` to pull the server-rendered view for a node |
 
 Both modes share the same jobs, prompts and results.
@@ -120,7 +120,7 @@ The service holds one persistent **default session**: its cursor and current vie
 
 - Input from any surface attached to the default session moves the one cursor, and the resulting `view` fans out to all of them. Concurrent input is last-write-wins; each `view` names the principal that produced it so surfaces may show, for example, "driven from the WebUI".
 - A `prompt` on the default session goes to every attached surface; the first `answer` wins and the others see it resolved. A confirmation stays bound to the invoking principal: attached surfaces can see it, but only the invoker can answer it.
-- Rich-mode clients navigate locally by definition; the WebUI exposes all three shapes — rich (private session), thin (private session) and thin (mirror of the default session) — via its mode control (UX polish round, Nov 9).
+- Rich-mode clients navigate locally by definition; since the Nov 10 panel redesign the WebUI is **one surface** — always a rich private session — with the panel mirror as an optional front-pane pane (a second, thin connection). The three-way mode control was dropped; thin-private remains reachable only as a dev flag.
 - The default session's state survives surfaces connecting and disconnecting; a reconnecting surface just receives the current `view`.
 
 ### Messages
