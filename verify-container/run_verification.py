@@ -9,6 +9,10 @@ Validates all Phase 2 exit criteria:
 - Server-side password-change revocation closing live WebSocket with 4401
 - Security boundaries: nginx auth_request, forged header dropping, origin check (1008),
   and local admin privilege check on local.sock (real UID 1001 operator gets FORBIDDEN).
+- The redesigned /menu page driven in real headless Chromium (Playwright,
+  drive_menu_ui.mjs) through nginx: hash routing, run-on-arrival for read-only
+  views only, no mutation without Run, paging, prompts, job progress, the Front
+  panel pane on a second connection, resume across a menud restart, logout.
 """
 
 from __future__ import annotations
@@ -26,6 +30,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -465,6 +471,127 @@ def http_logout(cookie_hdr: str, csrf_token: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Control channel for the browser-driven e2e (drive_menu_ui.mjs)
+# ---------------------------------------------------------------------------
+
+CONTROL_PORT = 8099
+
+
+class InvokeAudit(logging.Handler):
+    """Collects menud's audit-log invoke lines: the server-side record that an action ran."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.INFO)
+        self.invokes: list[dict[str, str]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if isinstance(record.msg, str) and record.msg.startswith("invoke %s by %s") and record.args:
+            node, user, kind = record.args[0], record.args[1], record.args[2]
+            self.invokes.append({"node": str(node), "user": str(user), "kind": str(kind)})
+
+
+class TuiClient:
+    """A raw TUI-style client on local.sock, attached to the default session."""
+
+    def __init__(self, sock_path: Path) -> None:
+        self.sock_path = sock_path
+        self.sock: socket.socket | None = None
+        self.last_view: dict | None = None
+        self.lock = threading.Lock()
+        self.n = 0
+
+    def _connect(self) -> None:
+        _, _, sock = raw_ws_connect_unix(self.sock_path)
+        sock.sendall(make_ws_frame(json.dumps({
+            "v": 1, "type": "hello", "id": "h:e2e-tui", "mode": "thin", "session": "default", "protocol": [1],
+            "client": {"name": "wlanpi-menu-tui"},
+        }).encode()))
+        welcome = read_ws_frame(sock)
+        assert welcome and welcome.get("type") == "welcome", f"TUI welcome: {welcome}"
+        self.sock = sock
+        self.last_view = drain_until(sock, lambda f: f.get("type") == "view")
+
+    def _drain(self, timeout: float) -> None:
+        while self.sock is not None:
+            f = read_ws_frame(self.sock, timeout)
+            if f is None:
+                return
+            if f.get("type") == "close":
+                self.sock = None
+                return
+            if f.get("type") == "view":
+                self.last_view = f
+
+    def press(self, key: str) -> dict | None:
+        with self.lock:
+            if self.sock is None:
+                self._connect()
+            self._drain(0.05)
+            if self.sock is None:
+                self._connect()
+            assert self.sock is not None
+            self.n += 1
+            mid = f"i:e2e:{self.n}"
+            self.sock.sendall(make_ws_frame(json.dumps({"v": 1, "type": "input", "id": mid, "key": key}).encode()))
+            reply = drain_until(self.sock, lambda f: f.get("type") == "view" and f.get("id") == mid)
+            if reply is not None:
+                self.last_view = reply
+            return reply
+
+    def view(self, wait: float = 0.6) -> dict | None:
+        with self.lock:
+            if self.sock is None:
+                self._connect()
+            self._drain(wait)
+            return self.last_view
+
+    def close(self) -> None:
+        with self.lock:
+            if self.sock is not None:
+                try:
+                    self.sock.close()
+                except OSError:
+                    pass
+                self.sock = None
+
+
+def start_control_server(handlers: dict) -> ThreadingHTTPServer:
+    """127.0.0.1 only. `handlers` maps "METHOD /path" to fn(query, body) -> JSON-able."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def _serve(self) -> None:
+            url = urllib.parse.urlsplit(self.path)
+            fn = handlers.get(f"{self.command} {url.path}")
+            if fn is None:
+                self.send_error(404)
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+            query = {k: v[-1] for k, v in urllib.parse.parse_qs(url.query).items()}
+            try:
+                out, status = fn(query, body), 200
+            except Exception as exc:  # reported to the driver, which fails that assertion
+                log.exception("control %s %s failed", self.command, url.path)
+                out, status = {"error": f"{exc.__class__.__name__}: {exc}"}, 500
+            data = json.dumps(out, default=str).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        do_GET = _serve
+        do_POST = _serve
+
+        def log_message(self, *args) -> None:  # keep the transcript to the driver's own lines
+            return
+
+    srv = ThreadingHTTPServer(("127.0.0.1", CONTROL_PORT), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+# ---------------------------------------------------------------------------
 # Main Verification Execution
 # ---------------------------------------------------------------------------
 
@@ -481,7 +608,6 @@ async def main():
 
     fake_core = FakeCore()
     tokens = TokenSource(("get-core-token",), runner=fake_core.token_runner())
-    core_client = CoreClient(BASE, tokens, transport=fake_core.transport())
 
     menud_proxy_sock = Path("/run/wlanpi-menud/proxy/proxy.sock")
     menud_local_sock = Path("/run/wlanpi-menud/local.sock")
@@ -494,17 +620,34 @@ async def main():
         allowed_origins=(),  # Origin netloc must match Host
         validate_outbound=True,
     )
-    service = Service(menud_config, core=core_client, tokens=tokens)
-    await Poller(service).poll_once()
-    server = Server(service)
-    await server.start()
+
+    # The running service lives in a holder so the browser e2e can restart it
+    # mid-run (a new Service means a new epoch, as on a real restart).
+    menud: dict = {}
+
+    async def start_menud() -> None:
+        core_client = CoreClient(BASE, tokens, transport=fake_core.transport())
+        svc = Service(menud_config, core=core_client, tokens=tokens)
+        await Poller(svc).poll_once()
+        srv = Server(svc)
+        await srv.start()
+        try:
+            os.chmod(menud_proxy_sock, 0o666)
+            os.chmod(menud_local_sock, 0o666)
+        except Exception:
+            pass
+        menud["service"], menud["server"] = svc, srv
+
+    async def stop_menud() -> None:
+        await menud["service"].aclose()
+        await menud["server"].close()
+
+    await start_menud()
     log.info("wlanpi-menud started: proxy.sock and local.sock ready")
 
-    try:
-        os.chmod(menud_proxy_sock, 0o666)
-        os.chmod(menud_local_sock, 0o666)
-    except Exception:
-        pass
+    invoke_audit = InvokeAudit()
+    logging.getLogger("wlanpi_menud.audit").addHandler(invoke_audit)
+    loop = asyncio.get_running_loop()
 
     results: list[tuple[str, bool, str]] = []
 
@@ -617,56 +760,24 @@ async def main():
         )
 
         # -------------------------------------------------------------------
-        # Test 5b: Rich click-to-view assertion (single action click renders table without a second click)
-        # Driven via real menu.js through live socket and real Flask page load
+        # Test 5d: Grouped interfaces table at protocol level (the browser-driven
+        # check of the same table is in Test 10)
         # -------------------------------------------------------------------
-        log.info("Running Test 5b: Rich click-to-view renders table without second click (driving real menu.js)...")
-        driver_script = WORKSPACE / "verify-container" / "drive_menu_click.mjs"
-        node_env = {**os.environ, "NODE_TLS_REJECT_UNAUTHORIZED": "0"}
-        res5b_proc = subprocess.run(
-            ["node", "--experimental-websocket", str(driver_script), ck_hdr_a],
-            capture_output=True,
-            text=True,
-            env=node_env,
-            timeout=15,
+        log.info("Running Test 5d: network.interfaces returns one grouped table...")
+        st5d, s5d, _ = browser_connect(
+            ck_hdr_a,
+            {"v": 1, "type": "hello", "id": "h:grouped", "mode": "rich", "session": "new", "protocol": [1]},
         )
-        has_table5b = False
-        prompts5b_count = -1
-        no_second_click_needed = False
-        res_json = None
-        if res5b_proc.returncode == 0:
-            try:
-                res_json = json.loads(res5b_proc.stdout.strip().splitlines()[-1])
-                has_table5b = bool(res_json.get("table"))
-                prompts5b_count = int(res_json.get("prompts", 0))
-                no_second_click_needed = bool(res_json.get("ok"))
-            except Exception as e:
-                log.error("Failed to parse drive_menu_click output: %s (stdout: %s, stderr: %s)", e, res5b_proc.stdout, res5b_proc.stderr)
-        else:
-            log.error("drive_menu_click failed with rc=%d: stdout=%s stderr=%s", res5b_proc.returncode, res5b_proc.stdout, res5b_proc.stderr)
-
+        drain_until(s5d, lambda f: f.get("type") == "menu")
+        s5d.sendall(make_ws_frame(json.dumps({"v": 1, "type": "invoke", "id": "act:grouped", "node": "network.interfaces"}).encode()))
+        res5d = drain_until(s5d, lambda f: f.get("type") == "job" and f.get("state") == "result")
+        s5d.close()
+        tables5d = [b for b in (res5d or {}).get("result", {}).get("blocks", []) if b.get("type") == "table"]
+        groups5d = [r[0] for t in tables5d for r in t.get("rows", []) if r and r[0]]
         check(
-            "Test 5b: Rich click-to-view: Network > Interfaces renders table without a second click",
-            no_second_click_needed,
-            f"table={has_table5b} prompts={prompts5b_count}",
-        )
-        grouped_table_5b = bool(res_json.get("groupedTable")) if res_json else False
-        bounds_ok_5b = bool(res_json.get("boundsOk")) if res_json else False
-        strip_ok_5b = bool(res_json.get("stripOk")) if res_json else False
-        check(
-            "Test 5d: Grouped interfaces table: Ethernet, WLAN, and Adapter sub-rows present",
-            grouped_table_5b,
-            f"grouped_table={grouped_table_5b}",
-        )
-        check(
-            "Test 5e: Results pane bounds: successive actions keep results DOM bounded (<=2)",
-            bounds_ok_5b,
-            f"bounds_ok={bounds_ok_5b} children={res_json.get('childrenCount') if res_json else -1}",
-        )
-        check(
-            "Test 5f: Device strip: Eth0 IP present in device strip",
-            strip_ok_5b,
-            f"strip_ok={strip_ok_5b}",
+            "Test 5d: Grouped interfaces table: one table with Ethernet and WLAN groups",
+            len(tables5d) == 1 and "Ethernet" in groups5d and "WLAN" in groups5d,
+            f"tables={len(tables5d)} groups={groups5d}",
         )
 
         # -------------------------------------------------------------------
@@ -899,7 +1010,7 @@ async def main():
         sock_tui.sendall(make_ws_frame(json.dumps({"v": 1, "type": "input", "id": "i:after", "key": "down"}).encode()))
         tui_after = drain_until(sock_tui, lambda f: f.get("type") == "view")
         check("Test 7e: TUI remains attached and driving default session", tui_after is not None)
-        check("Test 7f: Default session still present in service", default_id in service.sessions)
+        check("Test 7f: Default session still present in service", default_id in menud["service"].sessions)
 
         # New TUI attach gets same default session ID
         st_tui2, _, sock_tui2 = raw_ws_connect_unix(menud_local_sock)
@@ -985,11 +1096,99 @@ async def main():
         s_c_refused.close()
         check("Test 9c: Carol's old session cookie returns 401 at /ui/ws", st_c_refused == 401, f"status={st_c_refused}")
 
+        # -------------------------------------------------------------------
+        # Test 10: The redesigned /menu page in real headless Chromium
+        # (Playwright) through nginx, Flask and menud. Runs last: it restarts
+        # menud and logs its user out.
+        # -------------------------------------------------------------------
+        log.info("Running Test 10: browser-driven menu UI (Playwright, headless Chromium)...")
+        name_e, cookie_e, sid_e, csrf_e = mint_session(flask_app, "erin")
+        tui = TuiClient(menud_local_sock)
+
+        def on_loop(coro, timeout: float = 30.0):
+            return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout)
+
+        async def restart(down_ms: int) -> None:
+            await stop_menud()
+            await asyncio.sleep(down_ms / 1000)
+            await start_menud()
+
+        def ctl_restart(query, body):
+            tui.close()
+            on_loop(restart(int(body.get("down_ms", 3000))))
+            return {"epoch": menud["service"].epoch}
+
+        def ctl_attachments(query, body):
+            svc = menud["service"]
+            found = [
+                {"session": s.id, "kind": s.kind, "mode": s.mode, "client": (a.client or {}).get("name")}
+                for s in svc.sessions.values() for a in s.attachments
+                if a.principal.kind == "webui" and a.principal.name == query.get("user")
+            ]
+            return {"count": len(found), "attachments": found}
+
+        def ctl_core_set(query, body):
+            for k, v in body.items():
+                assert hasattr(fake_core, k), f"FakeCore has no {k}"
+                setattr(fake_core, k, v)
+            return {"ok": True}
+
+        control = start_control_server({
+            "GET /invokes": lambda q, b: {"invokes": list(invoke_audit.invokes)},
+            "POST /menud/restart": ctl_restart,
+            "GET /menud/attachments": ctl_attachments,
+            "POST /core": ctl_core_set,
+            "GET /core": lambda q, b: {"reboots": fake_core.reboots, "calls": dict(fake_core.calls)},
+            "POST /tui/input": lambda q, b: {"view": tui.press(b["key"])},
+            "GET /tui/view": lambda q, b: {"view": tui.view(float(q.get("wait", "0.6")))},
+        })
+
+        e2e_config = {
+            "base": "https://localhost",
+            "control": f"http://127.0.0.1:{CONTROL_PORT}",
+            "user": "erin",
+            "cookie": {"name": name_e, "value": cookie_e},
+            "csrf": csrf_e,
+        }
+        driver = WORKSPACE / "verify-container" / "drive_menu_ui.mjs"
+        ui_results: list[dict] = []
+        rc = -1
+        try:
+            proc = subprocess.Popen(
+                ["node", str(driver)],
+                env={**os.environ, "E2E_CONFIG": json.dumps(e2e_config)},
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+            killer = threading.Timer(900, proc.kill)
+            killer.start()
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line.startswith("RESULT "):
+                    try:
+                        ui_results.append(json.loads(line[len("RESULT "):]))
+                    except json.JSONDecodeError:
+                        log.error("unreadable driver result: %s", line)
+                elif line:
+                    log.info("[playwright] %s", line)
+            rc = proc.wait()
+            killer.cancel()
+        finally:
+            tui.close()
+            control.shutdown()
+        for r in ui_results:
+            check(f"Test 10 ({r.get('id')}): {r.get('name')}", bool(r.get("ok")), str(r.get("detail", "")))
+        check(
+            "Test 10: Playwright driver completed and reported its assertions",
+            rc == 0 and len(ui_results) >= 40,
+            f"rc={rc} assertions={len(ui_results)}",
+        )
+
     try:
         await asyncio.to_thread(run)
     finally:
         log.info("Cleaning up services...")
-        await server.close()
+        await menud["server"].close()
         nginx_proc.terminate()
         nginx_proc.wait(timeout=3)
 
