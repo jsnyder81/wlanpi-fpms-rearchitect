@@ -406,6 +406,12 @@ Repos: `wlanpi-fpms`, `wlanpi-core` (parity endpoints).
 
 Exit: every item the team marked required works on every supported model; a later release flips the default.
 
+#### Phase 3 first cut: end-state panel client (November 11, 2026)
+
+`wlanpi-fpms` branch **`phase3/menud-client`** (4 commits from `87b96cc`, published to jsnyder81/wlanpi-fpms): skips the opt-in mechanism — the legacy menu, pages and action modules are **deleted**, and `modules/menud_client/` makes the panel a pure thin-mode client of the service (default session, all 8 block types, prompts, paging, job cancel, epoch/seq resume with backoff, driven-by indicator, menu-unavailable screen with device IPs, `Wants=` not `Requires=`). Reviewed by Antigravity — APPROVE, zero defects (212-frame protocol transcripts, mutation checks, lintian-clean deb). Deliberately **not deployed to the test device** (FPMS fence) and no real-hardware run yet.
+
+Open policy calls before this shape could ship: kv secret values render unmasked on the panel; `Recommends:` vs `Depends:` on wlanpi-menud; and the plan's rollback-by-setting does not exist on this branch — reverting means reinstalling the old package.
+
 ### Later phases
 
 | Phase | Delivers | Depends on |
