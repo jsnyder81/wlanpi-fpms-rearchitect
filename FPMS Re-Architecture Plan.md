@@ -185,6 +185,8 @@ wlanpi-menud and wlanpi-fpms ship as dh\_virtualenv packages with private virtua
 
 **Providers** connect like any other client, register a menu subtree, answer `invoke` for their nodes and publish complications. A crashing provider loses its own subtree, not the panel; it can run as its own user; and it can be written in any language. The PoC's complications API becomes the provider `publish` call and keeps its TTL behaviour. Plugin and provider node ids are namespaced (`plugin.<name>.*`), and ids that collide with built-ins are refused.
 
+**Complications integration spec (Nov 13, 2026):** the full design for the above now lives in `wlanpi-menud/docs/complications-spec.md` — creation via `complication.publish/remove` frames on `local.sock` (+ `wlanpi-complication` CLI + `plugins.d` catalog declarations), namespaces `wlanpi.*` / `plugin.<name>.*` / `local.<user>.*`, new topics `complications.live/.catalog/.config` (legacy topic and `device.summary` frozen), server-side per-surface display profiles, built-in tiles derived from the poller. Approved with a decision log (§8); **implementation on hold** by user decision.
+
 **Touch screens** have two routes. A large touch display with its own UI (a kiosk browser or a native app) connects as a rich-mode surface and needs no panel code. A small touch display bolted to the panel needs an input driver in wlanpi-fpms that maps taps to on-screen regions; that comes after the panel opt-in ships.
 
 ## Panel rendering
