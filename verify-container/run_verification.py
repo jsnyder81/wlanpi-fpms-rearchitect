@@ -555,6 +555,24 @@ class TuiClient:
                 self.sock = None
 
 
+def publish_complication(sock_path: Path, fields: dict) -> dict | None:
+    """One-shot provider on local.sock (this process's uid is admin): an
+    ephemeral hello, one complication.publish, the reply. As the
+    wlanpi-complication CLI does it."""
+    _, _, sock = raw_ws_connect_unix(sock_path)
+    try:
+        sock.sendall(make_ws_frame(json.dumps({
+            "v": 1, "type": "hello", "id": "h:e2e-prov", "mode": "rich", "session": "new", "ephemeral": True,
+            "protocol": [1], "client": {"name": "e2e-provider"},
+        }).encode()))
+        welcome = read_ws_frame(sock)
+        assert welcome and welcome.get("type") == "welcome", f"provider welcome: {welcome}"
+        sock.sendall(make_ws_frame(json.dumps({"v": 1, "type": "complication.publish", "id": "c:e2e-pub", **fields}).encode()))
+        return drain_until(sock, lambda f: f.get("id") == "c:e2e-pub")
+    finally:
+        sock.close()
+
+
 def start_control_server(handlers: dict) -> ThreadingHTTPServer:
     """127.0.0.1 only. `handlers` maps "METHOD /path" to fn(query, body) -> JSON-able."""
 
@@ -1141,6 +1159,11 @@ async def main():
             "GET /core": lambda q, b: {"reboots": fake_core.reboots, "calls": dict(fake_core.calls)},
             "POST /tui/input": lambda q, b: {"view": tui.press(b["key"])},
             "GET /tui/view": lambda q, b: {"view": tui.view(float(q.get("wait", "0.6")))},
+            "POST /complication/publish": lambda q, b: {"reply": publish_complication(menud_local_sock, b)},
+            "GET /complications/user": lambda q, b: {
+                "file": json.loads(menud_config.complications_user_file.read_text())
+                if menud_config.complications_user_file and menud_config.complications_user_file.exists() else None,
+            },
         })
 
         e2e_config = {

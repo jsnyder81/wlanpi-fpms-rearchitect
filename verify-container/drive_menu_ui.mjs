@@ -184,8 +184,137 @@ await section("1", "/menu loads as one surface with device info", async () => {
   check("1e", "one connection, and it is the private menu", d.sockets.length === 1 && d.menuSockets().length === 1 && d.menuSockets()[0].sent[0].session === "new",
     `sockets=${d.sockets.length}`);
   check("1f", "Home runs nothing", d.invokes().length === 0 && (await auditInvokes()) === 0);
-  check("1g", "the menu connection subscribes to device.summary, alerts, complications and jobs",
-    JSON.stringify(d.sent("subscribe")[0]?.topics) === JSON.stringify(["device.summary", "alerts", "complications", "jobs"]));
+  // The service advertises complications.2, so the tile topics follow the legacy four.
+  check("1g", "the menu connection subscribes to device.summary, alerts, complications, jobs and the three tile topics",
+    JSON.stringify(d.sent("subscribe")[0]?.topics) === JSON.stringify([
+      "device.summary", "alerts", "complications", "jobs", "complications.live", "complications.catalog", "complications.config",
+    ]), JSON.stringify(d.sent("subscribe")[0]?.topics));
+});
+
+// ================================================================== status tiles (complications-spec 4, 6.3, 6.4 step 6)
+
+/** Spec 4.3 resolution, written again here so the page is checked against an independent copy. */
+function resolveShow(show, liveIds) {
+  const live = [...liveIds].sort();
+  const exact = new Set(show.filter((e) => !e.endsWith(".*")));
+  const out = [];
+  for (const e of show) {
+    if (e.endsWith(".*")) {
+      for (const id of live) if (id.startsWith(e.slice(0, -1)) && !exact.has(id) && !out.includes(id)) out.push(id);
+    } else if (live.includes(e) && !out.includes(e)) out.push(e);
+  }
+  return out;
+}
+
+/** The latest data the menu socket received on a topic. */
+function lastTopic(rec, topic) {
+  const evs = rec.received.filter((f) => f.type === "event" && f.topic === topic);
+  return evs.length ? evs[evs.length - 1].data : null;
+}
+
+const tileIds = (page, sel) => page.$$eval(sel, (els) => els.filter((e) => !e.hidden).map((e) => e.getAttribute("data-field") || e.getAttribute("data-tile")));
+
+async function waitConfig(rec, surface, pred) {
+  return until(() => {
+    const cfgData = lastTopic(rec, "complications.config");
+    const p = cfgData && cfgData.surfaces && cfgData.surfaces[surface];
+    return p && pred(p) ? p : null;
+  }, { timeout: 8000, what: `complications.config for ${surface}` });
+}
+
+await section("T", "status tiles: bar and Home from the webui profile; customize edits the front panel", async () => {
+  const rec = d.menuSockets()[0];
+  const welcome = rec.received.find((f) => f.type === "welcome");
+  check("Ta", "the service advertises complications.2", (welcome?.features || []).includes("complications.2"), JSON.stringify(welcome?.features));
+  await until(() => lastTopic(rec, "complications.live") && lastTopic(rec, "complications.config"), { what: "tile topics" });
+  await page.waitForSelector("#menu-statusbar .menu-sb-tile");
+  const live = lastTopic(rec, "complications.live");
+  const webui = lastTopic(rec, "complications.config").surfaces.webui;
+  const expected = resolveShow(webui.show, live.map((t) => t.app_id));
+  const bar = await tileIds(page, "#menu-statusbar .menu-sb-tile");
+  const more = await page.$eval("#menu-statusbar .menu-sb-more", (e) => (e.hidden ? 0 : parseInt(e.textContent.replace(/\D/g, ""), 10)));
+  await shot(page, "T1-tiles-bar-home");
+  check("Tb", "status bar draws the webui profile's live tiles in configured order (prefix that fits, rest in +N)",
+    bar.length >= 3 && JSON.stringify(bar) === JSON.stringify(expected.slice(0, bar.length)) && bar.length + more === expected.length,
+    `bar=${bar.join(",")} +${more} expected=${expected.join(",")}`);
+  const oneLine = await page.$eval("#menu-statusbar .menu-sb-tiles", (m) => m.scrollWidth <= m.clientWidth + 1);
+  check("Tc", "the tiles stay on one line (nothing overflows the bar)", oneLine);
+  const home = await tileIds(page, ".menu-tiles .menu-tile");
+  check("Td", "Home's tile card lists every resolved tile", JSON.stringify(home) === JSON.stringify(expected), home.join(","));
+  const vocab = await page.$$eval(".menu-tiles .menu-tile", (els) => els.map((e) => ({
+    status: e.getAttribute("data-status"), tag: (e.querySelector(".menu-tile-tag") || {}).textContent || "",
+  })));
+  const WORDS = { ok: /OK/, warn: /Warning/, error: /Error/, off: /Off/, unknown: /No reading/ };
+  check("Te", "every tile's status is in the closed vocabulary and carries its word (info: no tag)",
+    vocab.length > 0 && vocab.every((v) => (v.status === "info" ? v.tag === "" : WORDS[v.status] && WORDS[v.status].test(v.tag))), JSON.stringify(vocab));
+  const ipTile = live.find((t) => t.app_id === "wlanpi.ip");
+  check("Tf", "the IP tile shows the stub core's address", ipTile && ipTile.value === "192.0.2.10" &&
+    (await page.locator('#menu-statusbar [data-field="wlanpi.ip"] .menu-sb-value').innerText()) === "192.0.2.10", JSON.stringify(ipTile));
+
+  // A provider tile with markup in it: drawn as text everywhere.
+  const pub = (await ctl("POST", "/complication/publish", { app_id: "local.root.e2e", label: "E2E", value: "<b>x</b>", status: "warn", ttl_sec: 120 })).reply;
+  check("Tg", "a local.sock provider publishes a tile", pub && pub.type === "complication.ack" && pub.state === "live", JSON.stringify(pub));
+  await page.waitForSelector('.menu-tiles [data-tile="local.root.e2e"]');
+  const escaped = await page.evaluate(() => {
+    const el = document.querySelector('.menu-tiles [data-tile="local.root.e2e"] .menu-tile-value');
+    return { text: el.textContent, bold: Boolean(document.querySelector(".menu-tiles b, #menu-statusbar b")) };
+  });
+  check("Th", "a published tile appears without a reload and its text is never parsed as markup", escaped.text === "<b>x</b>" && !escaped.bold, JSON.stringify(escaped));
+
+  // Customize: the front panel's rows, edited from the browser, by keyboard.
+  await page.locator(".menu-tiles-customize").click();
+  await page.waitForFunction(() => document.querySelector("#menu-page")?.getAttribute("data-page") === "tiles");
+  const opts = await page.$$eval("#menu-tiles-surface option", (o) => o.map((x) => x.value));
+  check("Ti", "customize page offers all four profiles first (then any other profile the service holds)",
+    JSON.stringify(opts.slice(0, 4)) === JSON.stringify(["webui", "panel", "panel.strip", "tui"]), opts.join(","));
+  await page.selectOption("#menu-tiles-surface", "panel");
+  await page.waitForSelector('.menu-tiles-shown .menu-tiles-row');
+  const panelBefore = lastTopic(rec, "complications.config").surfaces.panel.show;
+  const first = panelBefore[0];
+  const second = panelBefore[1];
+  // Earlier tests left the default session somewhere in the menu: walk it back to home (left is Back).
+  let tuiBefore = (await ctl("GET", "/tui/view?wait=0.4")).view;
+  for (let i = 0; i < 8 && tuiBefore && tuiBefore.screen !== "home"; i++) tuiBefore = (await ctl("POST", "/tui/input", { key: "left" })).view;
+  const rowsOf = (v) => (v?.blocks || []).filter((b) => b.type === "kv").flatMap((b) => b.items || []).map((i) => i.key);
+  const down = page.locator(`.menu-tiles-shown [data-entry="${first}"] [data-menu-action="tile-down"]`);
+  await down.focus();
+  await page.keyboard.press("Enter");
+  const after = await waitConfig(rec, "panel", (p) => p.show[0] === second && p.show[1] === first && p.source === "user");
+  const sentCfg = d.sent("complications.configure").pop();
+  check("Tj", "Down (keyboard) sends one complications.configure for the panel profile; the page redraws from the config event",
+    Boolean(after) && sentCfg?.surface === "panel" && sentCfg.show[0] === second &&
+    (await page.$$eval(".menu-tiles-shown .menu-tiles-row", (r) => r.map((x) => x.getAttribute("data-entry"))))[0] === second,
+    JSON.stringify(sentCfg));
+  const focusKey = await page.evaluate(() => document.activeElement?.getAttribute("data-focus-key"));
+  check("Tk", "keyboard focus stays on the moved tile's button", focusKey === `tile-down:${first}`, String(focusKey));
+  const tuiAfter = await until(async () => {
+    const v = (await ctl("GET", "/tui/view?wait=0.6")).view;
+    const r = rowsOf(v);
+    return r.length && v.screen === "home" && rowsOf(tuiBefore)[0] !== r[0] ? v : null;
+  }, { timeout: 8000, what: "the panel's home view to change" }).catch(() => null);
+  check("Tl", "the front panel's home view (default session, seen from the TUI) follows the edit made in the browser",
+    Boolean(tuiAfter) && rowsOf(tuiAfter)[0] === rowsOf(tuiBefore)[1] && rowsOf(tuiAfter)[1] === rowsOf(tuiBefore)[0],
+    `before=${rowsOf(tuiBefore).join(",")} after=${rowsOf(tuiAfter).join(",")} view=${JSON.stringify(tuiBefore).slice(0, 300)}`);
+  const stored = (await ctl("GET", "/complications/user")).file;
+  check("Tm", "the edit is stored in the service's user layer", JSON.stringify(stored).includes(JSON.stringify(after.show)), JSON.stringify(stored));
+  await shot(page, "T2-tiles-customize-panel");
+
+  // Reset the panel, then trim the webui profile and watch the bar follow.
+  await page.locator('[data-menu-action="tiles-reset"]').click();
+  await waitConfig(rec, "panel", (p) => p.source === "default");
+  await page.selectOption("#menu-tiles-surface", "webui");
+  const firstWeb = webui.show[0];
+  await page.locator(`.menu-tiles-shown [data-entry="${firstWeb}"] [data-menu-action="tile-remove"]`).click();
+  await waitConfig(rec, "webui", (p) => !p.show.includes(firstWeb));
+  await page.waitForFunction((id) => !document.querySelector(`#menu-statusbar [data-field="${id}"]`), firstWeb);
+  check("Tn", "removing a tile from the webui profile removes it from the status bar", true, firstWeb);
+  await page.locator('[data-menu-action="tiles-reset"]').click();
+  const reset = await waitConfig(rec, "webui", (p) => p.source === "default");
+  await page.waitForSelector(`#menu-statusbar [data-field="${firstWeb}"]`);
+  check("To", "Reset to default restores the shipped list", JSON.stringify(reset.show) === JSON.stringify(webui.show));
+  check("Tp", "no page errors while customizing", d.errors.length === 0, d.errors.join(" | "));
+  await page.evaluate(() => { location.hash = ""; });
+  await waitForPage(page, "");
 });
 
 await section("2", "drill to Network > Interfaces: grouped table on arrival", async () => {
@@ -748,7 +877,17 @@ await section("10", "390 px viewport: drill navigation, sheet, no sideways scrol
   const noScroll = () => mp.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth);
   check("10a", "no sidebar on a phone; the filter is on Home", !(await mp.locator("#menu-sidebar").isVisible()) && (await mp.locator("#menu-filter-home").isVisible()));
   const bar = (await mp.locator("#menu-statusbar").innerText()).replace(/\s+/g, " ");
-  check("10b", "the status bar keeps host and IP", /wlanpi-test/.test(bar) && /192\.0\.2\.10/.test(bar) && !/Classic/.test(bar), bar);
+  // The bar follows the webui profile: the prefix that fits, the rest in +N (spec 4.5), compact forms on a phone.
+  const phoneBar = await mp.evaluate(() => {
+    const main = document.querySelector("#menu-statusbar .menu-sb-tiles");
+    const shown = [...document.querySelectorAll("#menu-statusbar .menu-sb-tile")].filter((e) => !e.hidden).map((e) => e.getAttribute("data-field"));
+    const all = [...document.querySelectorAll("#menu-statusbar .menu-sb-tile")].map((e) => e.getAttribute("data-field"));
+    const more = document.querySelector("#menu-statusbar .menu-sb-more");
+    return { shown, all, more: more && !more.hidden ? parseInt(more.textContent.replace(/\D/g, ""), 10) : 0, fits: main ? main.scrollWidth <= main.clientWidth + 1 : false };
+  });
+  check("10b", "the phone status bar keeps the host, shows the profile's first tiles in order on one line, and counts the rest in +N",
+    /wlanpi-test/.test(bar) && phoneBar.shown.length >= 2 && JSON.stringify(phoneBar.shown) === JSON.stringify(phoneBar.all.slice(0, phoneBar.shown.length)) &&
+    phoneBar.shown.length + phoneBar.more === phoneBar.all.length && phoneBar.fits && /192\.0\.2\.10/.test(bar), `${bar} ${JSON.stringify(phoneBar)}`);
   check("10c", "no horizontal page scroll on Home", await noScroll());
   await mp.locator('.menu-card[data-node="network"]').click();
   await waitForPage(mp, "network");
